@@ -18,3 +18,11 @@ The generic `activity_earnings_review` workflow supports this question when evid
 The existing record tools can store those observations when explicitly requested. No private gw2efficiency dataset is required, and current API state cannot recreate records that were never captured.
 
 Sources: live official GW2 API responses, the [account achievement API contract](https://wiki.guildwars2.com/wiki/API:2/account/achievements), and the registered MCP workflow and record tools.
+
+## Personal history source
+
+Rechecking the connected MCP record store returned an empty list. No Fractal or account snapshot exports were found in the current project trees.
+
+The public gw2efficiency frontend contains a Time Machine loader that calls `api().accountSnapshots().getWithEconomy(snapshotId)`. Its normalized snapshot includes `creationDate` and account data. This establishes a personal snapshot feature, but does not establish access to this user's snapshots, their retention window, or which achievement and material observations they contain. The frontend's current Fractal status view also does not establish historical completion dates.
+
+The remaining input is the location of the user's personal completion and account-value history, or an export from that source. The earlier instruction excluding private gw2efficiency datasets still applies; no browser credentials were read or account credentials sent to a third-party service. A snapshot comparison can support interval material changes, but attributing those changes to a Fractal run requires corresponding completion/session evidence and reconciliation of other item movements.
