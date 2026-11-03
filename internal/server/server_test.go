@@ -196,6 +196,21 @@ func TestRecordToolAnnotationsAndArbitraryJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tool := range listed.Tools {
+		if tool.Name == "put_record" {
+			schemaJSON, err := json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var schema struct {
+				Properties map[string]json.RawMessage `json:"properties"`
+			}
+			if err := json.Unmarshal(schemaJSON, &schema); err != nil {
+				t.Fatal(err)
+			}
+			if string(schema.Properties["data"]) != `{}` {
+				t.Fatalf("put_record data schema = %s, want an empty schema", schema.Properties["data"])
+			}
+		}
 		if tool.Name == "get_record" || tool.Name == "list_records" || tool.Name == "get_reference" {
 			if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
 				t.Errorf("%s is not marked read-only", tool.Name)

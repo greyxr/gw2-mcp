@@ -38,7 +38,16 @@ type recordSummary struct {
 func registerRecordTools(server *mcp.Server) {
 	writeHint := &mcp.ToolAnnotations{ReadOnlyHint: false, OpenWorldHint: boolPtr(false)}
 	readHint := &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(false)}
-	mcp.AddTool(server, &mcp.Tool{Name: "put_record", Description: "Explicitly save caller-provided local record data. Records are not fetched or saved automatically; do not include API keys or other secrets.", Annotations: writeHint}, func(_ context.Context, _ *mcp.CallToolRequest, in struct {
+	mcp.AddTool(server, &mcp.Tool{Name: "put_record", Description: "Explicitly save caller-provided local record data. Records are not fetched or saved automatically; do not include API keys or other secrets.", Annotations: writeHint, InputSchema: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string"},
+			"kind": map[string]any{"type": "string"},
+			"data": map[string]any{},
+		},
+		"required":             []string{"name", "kind", "data"},
+		"additionalProperties": false,
+	}}, func(_ context.Context, _ *mcp.CallToolRequest, in struct {
 		Name string `json:"name"`
 		Kind string `json:"kind"`
 		Data any    `json:"data"`
