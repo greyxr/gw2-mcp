@@ -1,0 +1,18 @@
+goos: linux
+goarch: amd64
+pkg: gw2mcp/internal/gw2
+cpu: Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz
+BenchmarkAccountOverview-12     	       5	  61242985 ns/op	   17398 B/op	     168 allocs/op
+BenchmarkAccountOverview-12     	       5	  61118373 ns/op	   18166 B/op	     168 allocs/op
+BenchmarkAccountOverview-12     	       5	  61140089 ns/op	   16038 B/op	     164 allocs/op
+BenchmarkFindItemsComplex-12    	       5	 285364427 ns/op	   78761 B/op	     904 allocs/op
+BenchmarkFindItemsComplex-12    	       5	 285530514 ns/op	   78435 B/op	     900 allocs/op
+BenchmarkFindItemsComplex-12    	       5	 285472475 ns/op	   78771 B/op	     900 allocs/op
+PASS
+ok  	gw2mcp/internal/gw2	6.264s
+Baseline scenario metadata:
+- Implementation: unchanged serial Client.Overview and Client.FindItems code.
+- Fixture: deterministic fake GW2 API transport, 20 ms delay on each HTTP request, bearer header checked for all 3 account overview requests and all 14 inventory requests.
+- BenchmarkAccountOverview: 3 requests/op (account, tokeninfo, wallet); expected ID/name/permissions/wallet verified.
+- BenchmarkFindItemsComplex: 14 requests/op (bank, materials, shared inventory, characters list, 10 character inventories); expected 64 total units, 13 locations, 14 successful sources verified.
+- Raw source snapshots: /tmp/gw2-performance-baseline/client.go and inventory.go

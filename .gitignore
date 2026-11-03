@@ -1,0 +1,9 @@
+.env
+.env.*
+/bin/
+/gw2-mcp
+/AURENE_*
+/exports/
+/records/
+/snapshots/
+*.log
