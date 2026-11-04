@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -62,10 +62,6 @@ func (c *Client) Get(ctx context.Context, path string, out any) error {
 func (c *Client) GetRaw(ctx context.Context, path string) ([]byte, error) {
 	response, err := c.request(ctx, path, false, false)
 	return response.Data, err
-}
-
-func (c *Client) Read(ctx context.Context, path string) (APIResponse, error) {
-	return c.ReadRoute(ctx, path, false)
 }
 
 func (c *Client) ReadRoute(ctx context.Context, path string, authenticated bool) (APIResponse, error) {
@@ -165,9 +161,6 @@ func (c *Client) redact(s string) string {
 	return s
 }
 func (c *Client) safe(err error) error {
-	if err == nil {
-		return nil
-	}
 	return fmt.Errorf("GW2 API request failed: %s", c.redact(err.Error()))
 }
 
@@ -181,79 +174,57 @@ type WalletEntry struct {
 	ID    int   `json:"id"`
 	Value int64 `json:"value"`
 }
-type accountResponse struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-type walletResponse struct {
-	ID    int   `json:"id"`
-	Value int64 `json:"value"`
-}
-type tokenInfoResponse struct {
-	Permissions []string `json:"permissions"`
-}
 
 func (c *Client) Overview(ctx context.Context) (Overview, error) {
-	var a accountResponse
-	var tokenInfo tokenInfoResponse
-	var wallet []walletResponse
-	var accountErr, tokenInfoErr, walletErr error
+	var result Overview
+	var account struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	var token struct {
+		Permissions []string `json:"permissions"`
+	}
+	paths := []string{"v2/account", "v2/tokeninfo", "v2/account/wallet"}
+	targets := []any{&account, &token, &result.Wallet}
+	errors := make([]error, len(paths))
+	parallel(len(paths), func(i int) { errors[i] = c.Get(ctx, paths[i], targets[i]) })
+	for _, err := range errors {
+		if err != nil {
+			return Overview{}, err
+		}
+	}
+	result.ID, result.Name, result.Permissions = account.ID, account.Name, token.Permissions
+	if result.Wallet == nil {
+		result.Wallet = []WalletEntry{}
+	}
+	return result, nil
+}
+
+func parallel(n int, run func(int)) {
+	jobs := make(chan int, n)
+	for i := range n {
+		jobs <- i
+	}
+	close(jobs)
 	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		accountErr = c.Get(ctx, "v2/account", &a)
-	}()
-	go func() {
-		defer wg.Done()
-		tokenInfoErr = c.Get(ctx, "v2/tokeninfo", &tokenInfo)
-	}()
-	go func() {
-		defer wg.Done()
-		walletErr = c.Get(ctx, "v2/account/wallet", &wallet)
-	}()
+	for range min(n, 4) {
+		wg.Go(func() {
+			for i := range jobs {
+				run(i)
+			}
+		})
+	}
 	wg.Wait()
-	if accountErr != nil {
-		return Overview{}, accountErr
-	}
-	if tokenInfoErr != nil {
-		return Overview{}, tokenInfoErr
-	}
-	if walletErr != nil {
-		return Overview{}, walletErr
-	}
-	o := Overview{ID: a.ID, Name: a.Name, Permissions: tokenInfo.Permissions, Wallet: make([]WalletEntry, len(wallet))}
-	for i, v := range wallet {
-		o.Wallet[i] = WalletEntry{ID: v.ID, Value: v.Value}
-	}
-	return o, nil
 }
+
+func getJSON[T any](ctx context.Context, c *Client, path string) (T, error) {
+	var result T
+	err := c.Get(ctx, path, &result)
+	return result, err
+}
+
 func (c *Client) Characters(ctx context.Context) ([]string, error) {
-	var names []string
-	if err := c.Get(ctx, "v2/characters", &names); err != nil {
-		return nil, err
-	}
-	return names, nil
-}
-
-type CraftingDiscipline struct {
-	Discipline string `json:"discipline"`
-	Rating     int    `json:"rating"`
-	Active     bool   `json:"active"`
-}
-
-func (c *Client) CraftingForCharacter(ctx context.Context, name string) ([]CraftingDiscipline, error) {
-	if strings.TrimSpace(name) == "" {
-		return nil, fmt.Errorf("character_name is required")
-	}
-	var response struct {
-		Crafting []CraftingDiscipline `json:"crafting"`
-	}
-	path := "v2/characters/" + url.PathEscape(name) + "/crafting"
-	if err := c.Get(ctx, path, &response); err != nil {
-		return nil, err
-	}
-	return response.Crafting, nil
+	return getJSON[[]string](ctx, c, "v2/characters")
 }
 
 type Item struct {
@@ -269,18 +240,12 @@ func (c *Client) Items(ctx context.Context, ids []int) ([]Item, error) {
 	if len(ids) < 1 || len(ids) > 200 {
 		return nil, fmt.Errorf("item_ids must contain 1 to 200 IDs")
 	}
-	unique := make([]int, 0, len(ids))
-	seen := make(map[int]bool, len(ids))
-	for _, id := range ids {
-		if id <= 0 {
-			return nil, fmt.Errorf("item IDs must be positive")
-		}
-		if !seen[id] {
-			unique = append(unique, id)
-			seen[id] = true
-		}
+	unique := slices.Clone(ids)
+	slices.Sort(unique)
+	unique = slices.Compact(unique)
+	if unique[0] <= 0 {
+		return nil, fmt.Errorf("item IDs must be positive")
 	}
-	sort.Ints(unique)
 
 	c.mu.Lock()
 	missing := make([]int, 0, len(unique))
@@ -301,7 +266,7 @@ func (c *Client) Items(ctx context.Context, ids []int) ([]Item, error) {
 		}
 		c.mu.Lock()
 		for _, item := range fetched {
-			if seen[item.ID] {
+			if _, requested := slices.BinarySearch(unique, item.ID); requested {
 				c.items[item.ID] = item
 			}
 		}
@@ -319,94 +284,4 @@ func (c *Client) Items(ctx context.Context, ids []int) ([]Item, error) {
 		out = append(out, item)
 	}
 	return out, nil
-}
-func (c *Client) SearchRecipes(ctx context.Context, outputItemID, ingredientItemID int) ([]int, error) {
-	query := url.Values{}
-	if outputItemID > 0 {
-		query.Set("output", fmt.Sprint(outputItemID))
-	} else {
-		query.Set("input", fmt.Sprint(ingredientItemID))
-	}
-	var recipeIDs []int
-	if err := c.Get(ctx, "v2/recipes/search?"+query.Encode(), &recipeIDs); err != nil {
-		return nil, err
-	}
-	return recipeIDs, nil
-}
-
-type RecipeIngredient struct {
-	Type  string `json:"type"`
-	ID    int    `json:"id"`
-	Count int    `json:"count"`
-}
-
-type Recipe struct {
-	ID              int                `json:"id"`
-	Type            string             `json:"type"`
-	OutputItemID    int                `json:"output_item_id"`
-	OutputItemCount int                `json:"output_item_count"`
-	Disciplines     []string           `json:"disciplines"`
-	MinRating       int                `json:"min_rating"`
-	Flags           []string           `json:"flags"`
-	Ingredients     []RecipeIngredient `json:"ingredients"`
-}
-
-func (c *Client) Recipes(ctx context.Context, ids []int) ([]Recipe, error) {
-	if len(ids) < 1 || len(ids) > 200 {
-		return nil, fmt.Errorf("recipe_ids must contain 1 to 200 IDs")
-	}
-	parts := make([]string, len(ids))
-	seen := make(map[int]struct{}, len(ids))
-	for i, id := range ids {
-		if id <= 0 {
-			return nil, fmt.Errorf("recipe IDs must be positive")
-		}
-		if _, exists := seen[id]; exists {
-			return nil, fmt.Errorf("recipe IDs must be unique")
-		}
-		seen[id] = struct{}{}
-		parts[i] = fmt.Sprint(id)
-	}
-	var recipes []Recipe
-	if err := c.Get(ctx, "v2/recipes?ids="+strings.Join(parts, ","), &recipes); err != nil {
-		return nil, err
-	}
-	return recipes, nil
-}
-
-type Currency struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Icon        string `json:"icon"`
-}
-
-func (c *Client) Currencies(ctx context.Context, ids []int) ([]Currency, error) {
-	if len(ids) < 1 || len(ids) > 200 {
-		return nil, fmt.Errorf("currency_ids must contain 1 to 200 IDs")
-	}
-	parts := make([]string, len(ids))
-	seen := make(map[int]struct{}, len(ids))
-	for i, id := range ids {
-		if id <= 0 {
-			return nil, fmt.Errorf("currency IDs must be positive")
-		}
-		if _, exists := seen[id]; exists {
-			return nil, fmt.Errorf("currency IDs must be unique")
-		}
-		seen[id] = struct{}{}
-		parts[i] = fmt.Sprint(id)
-	}
-	var currencies []Currency
-	if err := c.Get(ctx, "v2/currencies?ids="+strings.Join(parts, ","), &currencies); err != nil {
-		return nil, err
-	}
-	return currencies, nil
-}
-func (c *Client) AccountRecipes(ctx context.Context) ([]int, error) {
-	var recipeIDs []int
-	if err := c.Get(ctx, "v2/account/recipes", &recipeIDs); err != nil {
-		return nil, err
-	}
-	return recipeIDs, nil
 }

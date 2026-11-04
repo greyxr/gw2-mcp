@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"gw2mcp/internal/gw2"
 )
 
@@ -64,38 +64,36 @@ type listingBook struct {
 	Sells *[]depthLevel `json:"sells"`
 }
 
-func quoteHandler(api apiClient) func(context.Context, *mcp.CallToolRequest, quoteInput) (*mcp.CallToolResult, output, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in quoteInput) (*mcp.CallToolResult, output, error) {
+type marketClient interface {
+	Items(context.Context, []int) ([]gw2.Item, error)
+	ReadRoute(context.Context, string, bool) (gw2.APIResponse, error)
+}
+
+type quoteSnapshot struct {
+	items    map[int]gw2.Item
+	books    map[int]listingBook
+	response gw2.APIResponse
+	request  string
+}
+
+func quoteHandler(api marketClient) func(context.Context, quoteInput) (any, error) {
+	return func(ctx context.Context, in quoteInput) (any, error) {
 		if err := validateQuoteInput(in); err != nil {
-			return nil, output{}, err
+			return nil, err
 		}
-		items := make(map[int]gw2.Item)
-		if in.Mode == "sell_listing" || in.Mode == "sell_instant" {
-			metadata, err := api.Items(ctx, []int{in.ItemID})
-			if err != nil {
-				return nil, output{}, err
-			}
-			for _, item := range metadata {
-				items[item.ID] = item
-			}
-		}
-		books := make(map[int]listingBook)
-		if in.Mode == "sell_instant" || in.Mode == "buy_instant" {
-			var book listingBook
-			path := "/v2/commerce/listings/" + strconv.Itoa(in.ItemID)
-			if err := api.Get(ctx, path, &book); err != nil {
-				return nil, output{}, err
-			}
-			if book.ID != in.ItemID {
-				return nil, output{}, fmt.Errorf("market listing response item ID did not match request")
-			}
-			books[in.ItemID] = book
-		}
-		result, err := quoteFromSnapshot(in, items, books, time.Now().UTC().Format(time.RFC3339), false)
+		snapshot, err := loadQuoteSnapshot(ctx, api, []quoteInput{in})
 		if err != nil {
-			return nil, output{}, err
+			return nil, err
 		}
-		return nil, output{result}, nil
+		if snapshot.response.Partial {
+			return nil, fmt.Errorf("market listing response is partial")
+		}
+		stamp := snapshot.response.ObservedAt
+		result, err := quoteFromSnapshot(in, snapshot.items, snapshot.books, stamp.Format(time.RFC3339), false)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 }
 
@@ -118,83 +116,25 @@ func validateQuoteInput(in quoteInput) error {
 	return nil
 }
 
-func quoteTradesHandler(api apiClient) func(context.Context, *mcp.CallToolRequest, quoteTradesInput) (*mcp.CallToolResult, output, error) {
-	return func(ctx context.Context, _ *mcp.CallToolRequest, in quoteTradesInput) (*mcp.CallToolResult, output, error) {
+func quoteTradesHandler(api marketClient) func(context.Context, quoteTradesInput) (any, error) {
+	return func(ctx context.Context, in quoteTradesInput) (any, error) {
 		if len(in.Trades) < 1 || len(in.Trades) > 50 {
-			return nil, output{}, fmt.Errorf("trades must contain between 1 and 50 entries")
+			return nil, fmt.Errorf("trades must contain between 1 and 50 entries")
 		}
-		needsSaleCheck := make(map[int]bool)
-		needsBook := make(map[int]bool)
 		for _, trade := range in.Trades {
 			if err := validateQuoteInput(trade); err != nil {
-				return nil, output{}, err
-			}
-			if trade.Mode == "sell_instant" || trade.Mode == "sell_listing" {
-				needsSaleCheck[trade.ItemID] = true
-			}
-			if trade.Mode == "sell_instant" || trade.Mode == "buy_instant" {
-				needsBook[trade.ItemID] = true
+				return nil, err
 			}
 		}
-		observedAt := time.Now().UTC()
-		items := make(map[int]gw2.Item, len(needsSaleCheck))
-		if len(needsSaleCheck) > 0 {
-			ids := sortedItemIDs(needsSaleCheck)
-			metadata, err := api.Items(ctx, ids)
-			if err != nil {
-				return nil, output{}, err
-			}
-			for _, item := range metadata {
-				items[item.ID] = item
-			}
+		snapshot, err := loadQuoteSnapshot(ctx, api, in.Trades)
+		if err != nil {
+			return nil, err
 		}
-		books := make(map[int]listingBook, len(needsBook))
-		partial := false
-		statusCode := 0
-		var pagination map[string]string
-		requestPath := ""
-		if len(needsBook) > 0 {
-			ids := sortedItemIDs(needsBook)
-			params := url.Values{}
-			values := make([]string, len(ids))
-			for i, id := range ids {
-				values[i] = strconv.Itoa(id)
-			}
-			params.Set("ids", strings.Join(values, ","))
-			path := "/v2/commerce/listings?" + params.Encode()
-			requestPath = path
-			var raw json.RawMessage
-			if reader, ok := api.(interface {
-				Read(context.Context, string) (gw2.APIResponse, error)
-			}); ok {
-				response, err := reader.Read(ctx, path)
-				if err != nil {
-					return nil, output{}, err
-				}
-				raw = response.Data
-				partial = response.Partial
-				statusCode = response.StatusCode
-				pagination = response.Pagination
-				if !response.ObservedAt.IsZero() {
-					observedAt = response.ObservedAt
-				}
-			} else if err := api.Get(ctx, path, &raw); err != nil {
-				return nil, output{}, err
-			}
-			var rows []listingBook
-			if err := json.Unmarshal(raw, &rows); err != nil {
-				return nil, output{}, fmt.Errorf("invalid listings response: %w", err)
-			}
-			for _, book := range rows {
-				books[book.ID] = book
-			}
-		}
-
-		stamp := observedAt.UTC().Format(time.RFC3339)
+		stamp := snapshot.response.ObservedAt.UTC().Format(time.RFC3339)
 		results := make([]quoteTradeResult, 0, len(in.Trades))
 		for index, trade := range in.Trades {
 			row := quoteTradeResult{Index: index, ItemID: trade.ItemID, Quantity: trade.Quantity, Mode: trade.Mode, Status: "ok"}
-			value, err := quoteFromSnapshot(trade, items, books, stamp, true)
+			value, err := quoteFromSnapshot(trade, snapshot.items, snapshot.books, stamp, true)
 			if err != nil {
 				row.Status, row.Error = "error", err.Error()
 			} else {
@@ -202,15 +142,64 @@ func quoteTradesHandler(api apiClient) func(context.Context, *mcp.CallToolReques
 			}
 			results = append(results, row)
 		}
-		response := map[string]any{"results": results, "observed_at": stamp, "partial": partial, "pagination": pagination, "quotes_are_independent": true}
-		if requestPath != "" {
-			response["request"] = requestPath
-		}
-		if statusCode != 0 {
-			response["status_code"] = statusCode
-		}
-		return nil, output{response}, nil
+		return quoteBatch{Results: results, ObservedAt: stamp, Partial: snapshot.response.Partial,
+			Pagination: snapshot.response.Pagination, Independent: true, Request: snapshot.request, StatusCode: snapshot.response.StatusCode}, nil
 	}
+}
+
+type quoteBatch struct {
+	Results     []quoteTradeResult `json:"results"`
+	ObservedAt  string             `json:"observed_at"`
+	Partial     bool               `json:"partial"`
+	Pagination  map[string]string  `json:"pagination"`
+	Independent bool               `json:"quotes_are_independent"`
+	Request     string             `json:"request,omitempty"`
+	StatusCode  int                `json:"status_code,omitempty"`
+}
+
+func loadQuoteSnapshot(ctx context.Context, api marketClient, trades []quoteInput) (quoteSnapshot, error) {
+	saleIDs, bookIDs := map[int]bool{}, map[int]bool{}
+	for _, trade := range trades {
+		if trade.Mode == "sell_instant" || trade.Mode == "sell_listing" {
+			saleIDs[trade.ItemID] = true
+		}
+		if trade.Mode == "sell_instant" || trade.Mode == "buy_instant" {
+			bookIDs[trade.ItemID] = true
+		}
+	}
+	snapshot := quoteSnapshot{items: map[int]gw2.Item{}, books: map[int]listingBook{}, response: gw2.APIResponse{ObservedAt: time.Now().UTC()}}
+	if len(saleIDs) > 0 {
+		rows, err := api.Items(ctx, sortedItemIDs(saleIDs))
+		if err != nil {
+			return quoteSnapshot{}, err
+		}
+		for _, row := range rows {
+			snapshot.items[row.ID] = row
+		}
+	}
+	if len(bookIDs) == 0 {
+		return snapshot, nil
+	}
+	ids := sortedItemIDs(bookIDs)
+	values := make([]string, len(ids))
+	for i, id := range ids {
+		values[i] = strconv.Itoa(id)
+	}
+	query := url.Values{"ids": {strings.Join(values, ",")}}
+	snapshot.request = "/v2/commerce/listings?" + query.Encode()
+	response, err := api.ReadRoute(ctx, snapshot.request, false)
+	if err != nil {
+		return quoteSnapshot{}, err
+	}
+	snapshot.response = response
+	var rows []listingBook
+	if err := json.Unmarshal(response.Data, &rows); err != nil {
+		return quoteSnapshot{}, fmt.Errorf("invalid listings response: %w", err)
+	}
+	for _, row := range rows {
+		snapshot.books[row.ID] = row
+	}
+	return snapshot, nil
 }
 
 func sortedItemIDs(ids map[int]bool) []int {
@@ -242,57 +231,35 @@ func quoteFromSnapshot(in quoteInput, items map[int]gw2.Item, books map[int]list
 	if independent {
 		result.Warnings = append(result.Warnings, "Each batch row is estimated independently; repeated item rows do not reserve or consume depth from one another.")
 	}
+	var err error
 	if in.Mode == "buy_order" || in.Mode == "sell_listing" {
-		var err error
 		result, err = standingQuote(result, in.Quantity, in.UnitPrice)
-		if err != nil {
-			return quote{}, err
-		}
-		result.ObservedAt = observedAt
 	} else {
 		book, found := books[in.ItemID]
 		if !found {
 			return quote{}, fmt.Errorf("market listing was not returned; item may be unavailable")
 		}
-		var levels []depthLevel
+		levels := book.Sells
 		if in.Mode == "sell_instant" {
-			if book.Buys == nil {
-				return quote{}, fmt.Errorf("market listing response omitted buy depth")
-			}
-			levels = *book.Buys
-		} else {
-			if book.Sells == nil {
-				return quote{}, fmt.Errorf("market listing response omitted sell depth")
-			}
-			levels = *book.Sells
+			levels = book.Buys
 		}
-		var err error
-		result, err = depthQuote(result, levels, in.Quantity, in.Mode == "sell_instant")
-		if err != nil {
-			return quote{}, err
+		if levels == nil {
+			return quote{}, fmt.Errorf("market listing response omitted depth")
 		}
+		result, err = depthQuote(result, *levels, in.Quantity, in.Mode == "sell_instant")
+	}
+	if err != nil {
+		return quote{}, err
 	}
 	if in.Mode == "sell_instant" || in.Mode == "sell_listing" {
-		var err error
-		result, err = applySellerFees(result)
-		if err != nil {
-			return quote{}, err
-		}
-	} else {
-		result.NetEstimate = result.Gross
-		result.Upfront = result.Gross
+		return applySellerFees(result)
 	}
-	result.ObservedAt = observedAt
+	result.NetEstimate, result.Upfront = result.Gross, result.Gross
 	return result, nil
 }
 
 func hasSaleBinding(item gw2.Item) bool {
-	for _, flag := range item.Flags {
-		if flag == "AccountBound" || flag == "SoulbindOnAcquire" {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(item.Flags, "AccountBound") || slices.Contains(item.Flags, "SoulbindOnAcquire")
 }
 
 func depthQuote(result quote, levels []depthLevel, quantity int64, bids bool) (quote, error) {
@@ -310,10 +277,7 @@ func depthQuote(result quote, levels []depthLevel, quantity int64, bids bool) (q
 		if level.Quantity <= 0 || level.UnitPrice <= 0 {
 			continue
 		}
-		units := level.Quantity
-		if units > remaining {
-			units = remaining
-		}
+		units := min(level.Quantity, remaining)
 		amount, ok := checkedMul(units, level.UnitPrice)
 		if !ok {
 			return quote{}, fmt.Errorf("quote amount overflows int64")
@@ -339,15 +303,10 @@ func standingQuote(result quote, quantity, price int64) (quote, error) {
 }
 
 func applySellerFees(result quote) (quote, error) {
-	var ok bool
-	result.ListingFeeEstimate, ok = percentFloor(result.Gross, 5)
-	if !ok {
-		return quote{}, fmt.Errorf("fee amount overflows int64")
+	if result.Gross < 0 {
+		return quote{}, fmt.Errorf("gross amount must be nonnegative")
 	}
-	result.ExchangeFeeEstimate, ok = percentFloor(result.Gross, 10)
-	if !ok {
-		return quote{}, fmt.Errorf("fee amount overflows int64")
-	}
+	result.ListingFeeEstimate, result.ExchangeFeeEstimate = result.Gross/20, result.Gross/10
 	result.NetEstimate = result.Gross - result.ListingFeeEstimate - result.ExchangeFeeEstimate
 	result.DeliveryProceedsEstimate = result.Gross - result.ExchangeFeeEstimate
 	result.Upfront = result.ListingFeeEstimate
@@ -366,19 +325,4 @@ func checkedAdd(a, b int64) (int64, bool) {
 		return 0, false
 	}
 	return a + b, true
-}
-
-func percentFloor(value, percent int64) (int64, bool) {
-	if value < 0 || percent < 0 {
-		return 0, false
-	}
-	base, ok := checkedMul(value/100, percent)
-	if !ok {
-		return 0, false
-	}
-	extra, ok := checkedMul(value%100, percent)
-	if !ok {
-		return 0, false
-	}
-	return checkedAdd(base, extra/100)
 }

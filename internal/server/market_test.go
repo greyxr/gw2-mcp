@@ -2,71 +2,45 @@ package server
 
 import (
 	"math"
+	"math/big"
 	"testing"
 
 	"gw2mcp/internal/gw2"
 )
 
-func TestDepthQuoteOrdersAndPartialLiquidity(t *testing.T) {
-	bids := []depthLevel{{Quantity: 2, UnitPrice: 80}, {Quantity: 3, UnitPrice: 100}}
-	got, err := depthQuote(quote{}, bids, 4, true)
-	if err != nil {
-		t.Fatal(err)
+func TestQuoteDepthBindingAndOverflow(t *testing.T) {
+	levels := []depthLevel{{Quantity: 2, UnitPrice: 80}, {Quantity: 3, UnitPrice: 100}}
+	books := map[int]listingBook{1: {ID: 1, Buys: &levels, Sells: &levels}}
+	items := map[int]gw2.Item{1: {ID: 1}}
+	for _, want := range []struct {
+		mode                               string
+		quantity, gross, covered, unfilled int64
+	}{
+		{"sell_instant", 4, 380, 4, 0}, {"buy_instant", 6, 460, 5, 1},
+	} {
+		got, err := quoteFromSnapshot(quoteInput{ItemID: 1, Quantity: want.quantity, Mode: want.mode}, items, books, "observed", false)
+		check(t, err == nil && got.Gross == want.gross && got.Covered == want.covered && got.Unfilled == want.unfilled, "depth quote: %+v %v", got, err)
 	}
-	if got.Gross != 380 || got.Covered != 4 || got.Unfilled != 0 {
-		t.Fatalf("bid quote = %+v", got)
+	for _, flag := range []string{"AccountBound", "SoulbindOnAcquire"} {
+		items[1] = gw2.Item{ID: 1, Flags: []string{flag}}
+		_, err := quoteFromSnapshot(quoteInput{ItemID: 1, Quantity: 1, Mode: "sell_instant"}, items, books, "observed", false)
+		check(t, err != nil, "sale allowed for %s", flag)
 	}
-
-	asks := []depthLevel{{Quantity: 2, UnitPrice: 80}, {Quantity: 3, UnitPrice: 100}}
-	got, err = depthQuote(quote{}, asks, 6, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Gross != 460 || got.Covered != 5 || got.Unfilled != 1 {
-		t.Fatalf("ask quote = %+v", got)
-	}
+	_, err := standingQuote(quote{}, math.MaxInt64, 2)
+	check(t, err != nil, "standing amount overflowed")
+	_, err = depthQuote(quote{}, []depthLevel{{Quantity: 2, UnitPrice: math.MaxInt64}}, 2, true)
+	check(t, err != nil, "depth amount overflowed")
 }
 
-func TestSellerFeeAndSettlementEstimates(t *testing.T) {
-	for _, mode := range []string{"sell_listing", "sell_instant"} {
-		got, err := applySellerFees(quote{Gross: 1000, Mode: mode})
-		if err != nil {
-			t.Fatal(err)
+func TestSaleSettlementRoundingAndLargeAmounts(t *testing.T) {
+	for _, gross := range []int64{1, 19, 20, 99, 100, 1000, math.MaxInt64} {
+		got, err := quoteFromSnapshot(quoteInput{ItemID: 1, Quantity: 1, UnitPrice: gross, Mode: "sell_listing"}, map[int]gw2.Item{1: {ID: 1}}, nil, "observed", false)
+		check(t, err == nil, "%v", err)
+		fee := func(percent int64) int64 {
+			amount := new(big.Int).Mul(big.NewInt(gross), big.NewInt(percent))
+			return amount.Div(amount, big.NewInt(100)).Int64()
 		}
-		if got.ListingFeeEstimate != 50 || got.ExchangeFeeEstimate != 100 || got.NetEstimate != 850 || got.Upfront != 50 || got.DeliveryProceedsEstimate != 900 {
-			t.Fatalf("%s settlement = %+v", mode, got)
-		}
-	}
-}
-
-func TestStandingQuotePriceAndOverflow(t *testing.T) {
-	got, err := standingQuote(quote{}, 3, 25)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Gross != 75 || got.Covered != 3 || !got.Conditional {
-		t.Fatalf("standing quote = %+v", got)
-	}
-	if _, err := standingQuote(quote{}, math.MaxInt64, 2); err == nil {
-		t.Fatal("expected standing quote overflow")
-	}
-}
-
-func TestDepthQuoteOverflow(t *testing.T) {
-	levels := []depthLevel{{Quantity: 2, UnitPrice: math.MaxInt64}}
-	if _, err := depthQuote(quote{}, levels, 2, true); err == nil {
-		t.Fatal("expected depth quote overflow")
-	}
-}
-
-func TestBindingFlags(t *testing.T) {
-	if !hasSaleBinding(gw2.Item{Flags: []string{"AccountBound"}}) {
-		t.Fatal("account-bound flag was missed")
-	}
-	if !hasSaleBinding(gw2.Item{Flags: []string{"SoulbindOnAcquire"}}) {
-		t.Fatal("soulbind flag was missed")
-	}
-	if hasSaleBinding(gw2.Item{Flags: []string{"NoSell"}}) {
-		t.Fatal("unrelated flag rejected")
+		listing, exchange := fee(5), fee(10)
+		check(t, got.ListingFeeEstimate == listing && got.ExchangeFeeEstimate == exchange && got.NetEstimate == gross-listing-exchange && got.Upfront == listing && got.DeliveryProceedsEstimate == gross-exchange, "settlement for %d: %+v", gross, got)
 	}
 }

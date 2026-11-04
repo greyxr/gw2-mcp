@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
-	"sync"
 )
 
 type Location struct {
@@ -45,18 +44,10 @@ type characterBags struct {
 }
 
 type inventoryJob struct {
-	index     int
 	name      string
 	path      string
 	location  string
 	character bool
-}
-
-type inventorySourceResult struct {
-	index    int
-	source   Source
-	location string
-	counts   []int64
 }
 
 func (c *Client) FindItem(ctx context.Context, itemID int) (FindResult, error) {
@@ -98,36 +89,47 @@ func (c *Client) FindItems(ctx context.Context, itemIDs []int) (FindItemsResult,
 		return FindItemsResult{}, fmt.Errorf("GW2 API key is required for inventory endpoints")
 	}
 
-	chars, err := c.Characters(ctx)
-	charactersErr := err
-	if charactersErr == nil {
-		sort.Strings(chars)
-	}
+	chars, charactersErr := c.Characters(ctx)
+	sort.Strings(chars)
 	jobs := []inventoryJob{
-		{index: 0, name: "bank", path: "v2/account/bank", location: "bank"},
-		{index: 1, name: "materials", path: "v2/account/materials", location: "materials"},
-		{index: 2, name: "shared_inventory", path: "v2/account/inventory", location: "shared_inventory"},
+		{name: "bank", path: "v2/account/bank", location: "bank"},
+		{name: "materials", path: "v2/account/materials", location: "materials"},
+		{name: "shared_inventory", path: "v2/account/inventory", location: "shared_inventory"},
+		{name: "characters"},
 	}
 	if charactersErr == nil {
 		for _, name := range chars {
-			jobs = append(jobs, inventoryJob{
-				index: len(jobs), name: "character:" + name,
-				path:     "v2/characters/" + url.PathEscape(name) + "/inventory",
-				location: "character:" + name + ":bags", character: true,
-			})
+			jobs = append(jobs, inventoryJob{name: "character:" + name, path: "v2/characters/" + url.PathEscape(name) + "/inventory", location: "character:" + name + ":bags", character: true})
 		}
 	}
-	sourceResults := c.readInventorySources(ctx, jobs, indexByID, len(itemIDs))
-	for i := 0; i < 3; i++ {
-		appendInventorySource(&result, sourceResults[i])
-	}
-	if charactersErr != nil {
-		result.Complete = false
-		result.Sources = append(result.Sources, Source{Name: "characters", Status: "error", Error: charactersErr.Error()})
-	} else {
-		result.Sources = append(result.Sources, Source{Name: "characters", Status: "ok"})
-		for i := 3; i < len(sourceResults); i++ {
-			appendInventorySource(&result, sourceResults[i])
+	slots := make([][]slot, len(jobs))
+	errors := make([]error, len(jobs))
+	errors[3] = charactersErr
+	parallel(len(jobs), func(i int) {
+		if jobs[i].path != "" {
+			slots[i], errors[i] = c.inventorySlots(ctx, jobs[i])
+		}
+	})
+	for i, job := range jobs {
+		source := Source{Name: job.name, Status: "ok"}
+		if errors[i] != nil {
+			source.Status, source.Error, result.Complete = "error", errors[i].Error(), false
+		}
+		result.Sources = append(result.Sources, source)
+		if errors[i] != nil {
+			continue
+		}
+		counts := make([]int64, len(itemIDs))
+		for _, item := range slots[i] {
+			if index, ok := indexByID[item.ID]; ok && item.Count > 0 {
+				counts[index] += item.Count
+			}
+		}
+		for j, count := range counts {
+			if count > 0 {
+				result.Items[j].Locations = append(result.Items[j].Locations, Location{Location: job.location, Count: count})
+				result.Items[j].ObservedTotal += count
+			}
 		}
 	}
 	for i := range result.Items {
@@ -138,79 +140,17 @@ func (c *Client) FindItems(ctx context.Context, itemIDs []int) (FindItemsResult,
 	return result, nil
 }
 
-func (c *Client) readInventorySources(ctx context.Context, jobs []inventoryJob, indexByID map[int]int, itemCount int) []inventorySourceResult {
-	work := make(chan inventoryJob)
-	results := make(chan inventorySourceResult, len(jobs))
-	workers := 4
-	if len(jobs) < workers {
-		workers = len(jobs)
+func (c *Client) inventorySlots(ctx context.Context, job inventoryJob) ([]slot, error) {
+	if !job.character {
+		return getJSON[[]slot](ctx, c, job.path)
 	}
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range work {
-				results <- c.readInventorySource(ctx, job, indexByID, itemCount)
-			}
-		}()
+	bags, err := getJSON[characterBags](ctx, c, job.path)
+	var slots []slot
+	if err != nil {
+		return nil, err
 	}
-	for _, job := range jobs {
-		work <- job
+	for _, bag := range bags.Bags {
+		slots = append(slots, bag.Inventory...)
 	}
-	close(work)
-	ordered := make([]inventorySourceResult, len(jobs))
-	for range jobs {
-		result := <-results
-		ordered[result.index] = result
-	}
-	wg.Wait()
-	return ordered
-}
-
-func (c *Client) readInventorySource(ctx context.Context, job inventoryJob, indexByID map[int]int, itemCount int) inventorySourceResult {
-	result := inventorySourceResult{index: job.index, location: job.location, counts: make([]int64, itemCount)}
-	addSlot := func(item slot) {
-		if index, ok := indexByID[item.ID]; ok && item.Count > 0 {
-			result.counts[index] += item.Count
-		}
-	}
-	if job.character {
-		var bags characterBags
-		if err := c.Get(ctx, job.path, &bags); err != nil {
-			result.source = Source{Name: job.name, Status: "error", Error: err.Error()}
-			return result
-		}
-		for _, bag := range bags.Bags {
-			for _, item := range bag.Inventory {
-				addSlot(item)
-			}
-		}
-	} else {
-		var slots []slot
-		if err := c.Get(ctx, job.path, &slots); err != nil {
-			result.source = Source{Name: job.name, Status: "error", Error: err.Error()}
-			return result
-		}
-		for _, item := range slots {
-			addSlot(item)
-		}
-	}
-	result.source = Source{Name: job.name, Status: "ok"}
-	return result
-}
-
-func appendInventorySource(result *FindItemsResult, source inventorySourceResult) {
-	result.Sources = append(result.Sources, source.source)
-	if source.source.Status == "error" {
-		result.Complete = false
-		return
-	}
-	for i, count := range source.counts {
-		if count <= 0 {
-			continue
-		}
-		result.Items[i].Locations = append(result.Items[i].Locations, Location{Location: source.location, Count: count})
-		result.Items[i].ObservedTotal += count
-	}
+	return slots, err
 }

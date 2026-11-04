@@ -1,0 +1,12 @@
+goos: linux
+goarch: amd64
+pkg: gw2mcp/internal/gw2
+cpu: Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz
+BenchmarkAccountOverview-12     	       5	  20376065 ns/op	   14659 B/op	     129 allocs/op
+BenchmarkAccountOverview-12     	       5	  20530687 ns/op	   16761 B/op	     131 allocs/op
+BenchmarkAccountOverview-12     	       5	  20579775 ns/op	   15372 B/op	     129 allocs/op
+BenchmarkFindItemsComplex-12    	       5	 101825657 ns/op	   61275 B/op	     605 allocs/op
+BenchmarkFindItemsComplex-12    	       5	 101015374 ns/op	   61614 B/op	     613 allocs/op
+BenchmarkFindItemsComplex-12    	       5	 101478296 ns/op	   60555 B/op	     605 allocs/op
+PASS
+ok  	gw2mcp/internal/gw2	2.211s

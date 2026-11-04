@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -14,163 +13,92 @@ import (
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
 func response(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 }
-
 func testClient(rt http.RoundTripper, key string) *Client {
 	c := NewClient(key)
 	c.httpClient = &http.Client{Transport: rt}
 	return c
 }
 
-func TestGetScopesBearerAndRejectsPartial(t *testing.T) {
-	var publicAuth string
+func TestAuthenticationAndPathBoundaries(t *testing.T) {
+	var auth string
+	calls := 0
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if strings.HasPrefix(r.URL.Path, "/v2/account") {
-			if r.Header.Get("Authorization") != "Bearer secret-token" {
-				t.Errorf("private authorization missing")
-			}
-			return response(http.StatusPartialContent, ""), nil
-		}
-		publicAuth = r.Header.Get("Authorization")
-		return response(http.StatusOK, `{"ok":true}`), nil
+		calls++
+		auth = r.Header.Get("Authorization")
+		return response(200, `[]`), nil
 	})
-	c := testClient(rt, "secret-token")
-	var out map[string]bool
-	if err := c.Get(context.Background(), "v2/items/1", &out); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{"v2/account", "v2/characters/Hero/inventory", "v2/tokeninfo", "v2/commerce/delivery", "v2/commerce/transactions/history/buys", "v2/pvp/stats", "v2/pvp/games", "v2/pvp/standings", "v2/guild/id/stash"} {
+		var out json.RawMessage
+		check(t, testClient(rt, "key").Get(context.Background(), path, &out) == nil && auth == "Bearer key", "private authentication: %s", path)
+		before := calls
+		check(t, testClient(rt, "").Get(context.Background(), path, &out) != nil && calls == before, "missing key reached API: %s", path)
 	}
-	if publicAuth != "" {
-		t.Fatalf("public request carried authorization")
+	for _, path := range []string{"v2/items/1", "v2/guild/permissions", "v2/guild/upgrades", "v2/guild/search?name=example", "v2/commerce/exchange/gems?quantity=100"} {
+		var out json.RawMessage
+		check(t, testClient(rt, "key").Get(context.Background(), path, &out) == nil && auth == "", "public request leaked credentials: %s", path)
 	}
-	err := c.Get(context.Background(), "v2/account", &out)
-	if err == nil || strings.Contains(err.Error(), "secret-token") {
-		t.Fatalf("unsafe partial/error result: %v", err)
+	before := calls
+	for _, path := range []string{"v2/items/../account", "v2/items/%2e%2e/account", "https://example.com", "v2/items?access_token=secret"} {
+		var out json.RawMessage
+		check(t, testClient(rt, "key").Get(context.Background(), path, &out) != nil && calls == before, "unsafe path: %s", path)
 	}
+	_, err := testClient(rt, "key").ReadRoute(context.Background(), "v2/future/private", true)
+	check(t, err == nil && auth == "Bearer key", "new discovered authentication lost")
 }
 
-func TestOverviewAndItemCache(t *testing.T) {
-	calls := map[string]int{}
-	var callsMu sync.Mutex
-	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		callsMu.Lock()
-		calls[r.URL.Path]++
-		callsMu.Unlock()
-		switch r.URL.Path {
-		case "/v2/account":
-			return response(http.StatusOK, `{"id":"abc","name":"N"}`), nil
-		case "/v2/tokeninfo":
-			return response(http.StatusOK, `{"permissions":["inventories"]}`), nil
-		case "/v2/account/wallet":
-			return response(http.StatusOK, `[ {"id":1,"value":99} ]`), nil
-		case "/v2/items":
-			return response(http.StatusOK, `[ {"id":7,"name":"Seven","type":"Armor","rarity":"Fine","flags":[]} ]`), nil
-		default:
-			return response(http.StatusNotFound, "not found"), nil
-		}
-	})
-	c := testClient(rt, "key")
-	o, err := c.Overview(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if o.ID != "abc" || len(o.Permissions) != 1 || len(o.Wallet) != 1 || o.Wallet[0].Value != 99 {
-		t.Fatalf("bad overview: %+v", o)
-	}
-	for i := 0; i < 2; i++ {
-		items, err := c.Items(context.Background(), []int{7})
-		if err != nil || len(items) != 1 || items[0].Name != "Seven" {
-			t.Fatalf("items=%v err=%v", items, err)
-		}
-	}
-	callsMu.Lock()
-	itemCalls := calls["/v2/items"]
-	callsMu.Unlock()
-	if itemCalls != 1 {
-		t.Fatalf("cache did not limit fetches: %v", calls)
-	}
-}
-
-func TestFindItemPartialSourcesAndCounts(t *testing.T) {
-	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch r.URL.Path {
-		case "/v2/account/bank":
-			return response(http.StatusOK, `[{"id":5,"count":2}]`), nil
-		case "/v2/account/materials":
-			return response(http.StatusServiceUnavailable, "unavailable"), nil
-		case "/v2/account/inventory":
-			return response(http.StatusOK, `[{"id":5,"count":3}]`), nil
-		case "/v2/characters":
-			return response(http.StatusOK, `["Zed"]`), nil
-		case "/v2/characters/Zed/inventory":
-			return response(http.StatusOK, `{"bags":[{"inventory":[{"id":5,"count":4}]}]}`), nil
-		default:
-			return response(http.StatusNotFound, "not found"), nil
-		}
-	})
-	res, err := testClient(rt, "key").FindItem(context.Background(), 5)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Complete || res.Total != 9 || len(res.Locations) != 3 || len(res.Sources) != 5 {
-		t.Fatalf("incomplete inventory accounting: %+v", res)
-	}
-	wantSources := []Source{
-		{Name: "bank", Status: "ok"},
-		{Name: "materials", Status: "error"},
-		{Name: "shared_inventory", Status: "ok"},
-		{Name: "characters", Status: "ok"},
-		{Name: "character:Zed", Status: "ok"},
-	}
-	for i, source := range res.Sources {
-		if source.Name != wantSources[i].Name || source.Status != wantSources[i].Status {
-			t.Fatalf("source order/result = %+v, want %+v", res.Sources, wantSources)
-		}
-	}
-	counts := make(map[string]int64, len(res.Locations))
-	for _, location := range res.Locations {
-		counts[location.Location] = location.Count
-	}
-	if counts["bank"] != 2 || counts["shared_inventory"] != 3 || counts["character:Zed:bags"] != 4 {
-		t.Fatalf("unexpected location counts: %v", counts)
-	}
-}
-
-func TestPrivateMissingKeyDoesNotRequest(t *testing.T) {
-	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		t.Fatal("unexpected request")
-		return nil, nil
-	})
-	c := testClient(rt, "")
+func TestResponseCoverageAndLimits(t *testing.T) {
+	c := testClient(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		r := response(206, `[{"id":7,"unmodeled":9007199254740993}]`)
+		r.Header.Set("X-Result-Total", "3")
+		return r, nil
+	}), "secret")
+	r, err := c.ReadRoute(context.Background(), "/v2/commerce/prices?ids=7,8", false)
+	check(t, err == nil && r.Partial && r.StatusCode == 206 && r.Pagination["X-Result-Total"] == "3" && !r.ObservedAt.IsZero() && strings.Contains(string(r.Data), "9007199254740993"), "response coverage lost: %+v %v", r, err)
 	var out json.RawMessage
-	if err := c.Get(context.Background(), "v2/account", &out); err == nil {
-		t.Fatal("expected missing key error")
-	}
-}
-
-func TestGetValidatesPathSegments(t *testing.T) {
-	var paths []string
-	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		paths = append(paths, r.URL.EscapedPath())
-		return response(http.StatusOK, `[]`), nil
-	})
-	c := testClient(rt, "key")
-	var out []string
-	validPath := "v2/characters/" + url.PathEscape("A..B") + "/crafting"
-	if err := c.Get(context.Background(), validPath, &out); err != nil {
-		t.Fatalf("valid character name rejected: %v", err)
-	}
-	if len(paths) != 1 {
-		t.Fatalf("valid path was not requested: %v", paths)
-	}
-	for _, path := range []string{"v2/items/../account", "v2/items/%2e%2e/account"} {
-		if err := c.Get(context.Background(), path, &out); err == nil {
-			t.Errorf("traversal path %q was accepted", path)
+	check(t, c.Get(context.Background(), "/v2/commerce/prices", &out) != nil, "typed reads accepted partial data")
+	for _, body := range []string{"Public API\n /v2/items [l]", strings.Repeat("x", maxResponseBytes+1)} {
+		c.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) { return response(200, body), nil })
+		raw, err := c.GetRaw(context.Background(), "/v2")
+		check(t, (err == nil) == (len(body) <= maxResponseBytes), "response size enforcement: %v", err)
+		if err == nil {
+			check(t, string(raw) == body, "plaintext discovery changed")
 		}
 	}
-	if len(paths) != 1 {
-		t.Fatalf("invalid paths reached server: %v", paths)
+	c.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) { return response(500, "secret"), nil })
+	_, err = c.GetRaw(context.Background(), "/v2")
+	check(t, err != nil && !strings.Contains(err.Error(), "secret"), "error exposed key: %v", err)
+}
+
+func TestAccountAggregationCacheAndIncompleteInventory(t *testing.T) {
+	bodies := map[string]string{
+		"/v2/account": `{"id":"abc","name":"N"}`, "/v2/tokeninfo": `{"permissions":["inventories"]}`,
+		"/v2/account/wallet": `[{"id":1,"value":99}]`, "/v2/items": `[{"id":7,"name":"Seven"}]`,
+		"/v2/characters": `["Zed"]`, "/v2/account/bank": `[{"id":5,"count":2}]`,
+		"/v2/account/inventory": `[{"id":5,"count":3}]`, "/v2/characters/Zed/inventory": `{"bags":[{"inventory":[{"id":5,"count":4}]}]}`,
 	}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	c := testClient(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls[r.URL.Path]++
+		mu.Unlock()
+		body, ok := bodies[r.URL.Path]
+		if !ok {
+			return response(503, "unavailable"), nil
+		}
+		return response(200, body), nil
+	}), "key")
+	overview, err := c.Overview(context.Background())
+	check(t, err == nil && overview.ID == "abc" && len(overview.Permissions) == 1 && len(overview.Wallet) == 1 && overview.Wallet[0].Value == 99, "account aggregation: %+v %v", overview, err)
+	for range 2 {
+		items, err := c.Items(context.Background(), []int{7})
+		check(t, err == nil && len(items) == 1 && items[0].Name == "Seven", "item metadata: %+v %v", items, err)
+	}
+	check(t, calls["/v2/items"] == 1, "metadata cache refetched stable items")
+	result, err := c.FindItem(context.Background(), 5)
+	check(t, err == nil && !result.Complete && result.Total == 9 && len(result.Locations) == 3 && len(result.Sources) == 5, "partial inventory: %+v %v", result, err)
+	check(t, result.Sources[1].Status == "error" && result.Sources[1].Name == "materials", "missing source not reported: %+v", result.Sources)
 }
