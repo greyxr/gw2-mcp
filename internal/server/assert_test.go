@@ -37,14 +37,18 @@ func callTool(t testing.TB, ctx context.Context, session *mcp.ClientSession, nam
 	return result
 }
 
+func toolText(t testing.TB, result *mcp.CallToolResult) string {
+	t.Helper()
+	check(t, result != nil && len(result.Content) == 1 && result.StructuredContent == nil, "tool result is not a single text block: %+v", result)
+	content, ok := result.Content[0].(*mcp.TextContent)
+	check(t, ok, "tool content is %T", result.Content[0])
+	return content.Text
+}
+
 func toolData[T any](t testing.TB, result *mcp.CallToolResult) T {
 	t.Helper()
-	check(t, result != nil && result.StructuredContent != nil, "tool result has no structured content")
-	encoded, err := json.Marshal(result.StructuredContent)
-	check(t, err == nil, "encode tool result: %v", err)
-	var wrapped struct {
-		Data T `json:"data"`
-	}
-	check(t, json.Unmarshal(encoded, &wrapped) == nil, "decode tool result: %s", encoded)
-	return wrapped.Data
+	var data T
+	text := toolText(t, result)
+	check(t, json.Unmarshal([]byte(text), &data) == nil, "decode tool result: %s", text)
+	return data
 }

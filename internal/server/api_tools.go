@@ -1,13 +1,18 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -15,20 +20,32 @@ import (
 )
 
 type apiRoute struct {
-	Route             string `json:"route"`
-	RequiresAuth      bool   `json:"requires_auth,omitempty"`
-	LocaleAware       bool   `json:"locale_aware,omitempty"`
-	CurrentlyDisabled bool   `json:"currently_disabled,omitempty"`
+	Route        string
+	RequiresAuth bool
+	LocaleAware  bool
+	Disabled     bool
 }
 
 type apiQueryInput struct {
-	Route      string            `json:"route"`
-	PathParams map[string]string `json:"path_params,omitempty"`
-	IDs        []string          `json:"ids,omitempty"`
+	Route      string            `json:"route" jsonschema:"route from list_api_endpoints, e.g. characters/:id/equipment"`
+	PathParams map[string]string `json:"path_params,omitempty" jsonschema:"values for :name route segments"`
+	IDs        []string          `json:"ids,omitempty" jsonschema:"up to 200 IDs, or [\"all\"] where the endpoint allows it"`
 	Page       *int              `json:"page,omitempty"`
-	PageSize   *int              `json:"page_size,omitempty"`
-	Lang       string            `json:"lang,omitempty"`
-	Filters    map[string]string `json:"filters,omitempty"`
+	PageSize   *int              `json:"page_size,omitempty" jsonschema:"1-200"`
+	Lang       string            `json:"lang,omitempty" jsonschema:"en, de, es, fr, or zh"`
+	Filters    map[string]string `json:"filters,omitempty" jsonschema:"route-specific query parameters"`
+	Fields     []string          `json:"fields,omitempty" jsonschema:"keep only these top-level keys of each returned object"`
+	Offset     int               `json:"offset,omitempty" jsonschema:"skip this many elements of the returned array (next_offset of a cut result); unlike page, it slices one API response"`
+}
+
+type apiQueryResult struct {
+	Request    string          `json:"request"`
+	ObservedAt string          `json:"observed_at"`
+	Data       any             `json:"data"`
+	Partial    bool            `json:"partial,omitempty"`
+	Pagination *gw2.Pagination `json:"pagination,omitempty"`
+	Total      int             `json:"total,omitempty"`
+	NextOffset int             `json:"next_offset,omitempty"`
 }
 
 type apiReader interface {
@@ -36,35 +53,82 @@ type apiReader interface {
 	ReadRoute(context.Context, string, bool) (gw2.APIResponse, error)
 }
 
+const maxDataChars = 24000
+const maxObjectChars = 4 * maxDataChars
+const catalogTTL = time.Hour
+
+type apiCatalog struct {
+	api     apiReader
+	mu      sync.Mutex
+	routes  []apiRoute
+	fetched time.Time
+}
+
+func (c *apiCatalog) load(ctx context.Context) ([]apiRoute, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.routes != nil && time.Since(c.fetched) < catalogTTL {
+		return c.routes, nil
+	}
+	routes, err := discoverRoutes(ctx, c.api)
+	if err != nil {
+		return nil, err
+	}
+	c.routes, c.fetched = routes, time.Now()
+	return routes, nil
+}
+
 func registerAPITools(server *mcp.Server, api apiReader) {
-	addRead(server, "list_api_endpoints", "List routes exposed by the official Guild Wars 2 API discovery endpoint.", func(ctx context.Context, _ struct{}) (any, error) {
-		routes, err := discoverRoutes(ctx, api)
-		return map[string]any{"endpoints": routes}, err
+	catalog := &apiCatalog{api: api}
+	addRead(server, "list_api_endpoints", "List official GW2 API v2 routes for query_api, one per line. [a] needs the API key, [l] accepts lang. Pass prefix (e.g. account, commerce, wvw) to narrow the list.", func(ctx context.Context, in struct {
+		Prefix string `json:"prefix,omitempty"`
+	}) (any, error) {
+		routes, err := catalog.load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		prefix := normalizeAPIRoute(in.Prefix)
+		var lines []string
+		for _, route := range routes {
+			if route.Disabled || !strings.HasPrefix(route.Route, prefix) {
+				continue
+			}
+			line := route.Route
+			if route.RequiresAuth {
+				line += " [a]"
+			}
+			if route.LocaleAware {
+				line += " [l]"
+			}
+			lines = append(lines, line)
+		}
+		if len(lines) == 0 {
+			return nil, fmt.Errorf("no enabled routes match prefix %q", in.Prefix)
+		}
+		return strings.Join(lines, "\n"), nil
 	})
-	addRead(server, "query_api", "Read JSON from a discovered GW2 API route. Substitute declared path parameters and use bounded IDs, pagination, language, and route-specific filters. Arbitrary URLs and query parameters are not accepted.", func(ctx context.Context, in apiQueryInput) (any, error) {
-		routes, err := discoverRoutes(ctx, api)
+	addRead(server, "query_api", fmt.Sprintf("Read any GW2 API v2 route from list_api_endpoints. A route without ids or page usually returns its ID list. Use fields to keep only needed keys. Arrays are cut near %d characters and continue from next_offset; partial means some requested ids do not exist. Filters: quantity (commerce/exchange/*), input or output (recipes/search), name (guild/search), world (wvw/matches*), since (guild/:id/log).", maxDataChars), func(ctx context.Context, in apiQueryInput) (any, error) {
+		routes, err := catalog.load(ctx)
 		if err != nil {
 			return nil, err
 		}
 		route := normalizeAPIRoute(in.Route)
-		var selected *apiRoute
-		for i := range routes {
-			if routes[i].Route == route {
-				selected = &routes[i]
-				break
-			}
-		}
-		if selected == nil {
+		index := slices.IndexFunc(routes, func(r apiRoute) bool { return r.Route == route })
+		if index < 0 {
 			return nil, fmt.Errorf("route must exactly match a route returned by list_api_endpoints")
 		}
-		if selected.CurrentlyDisabled {
+		selected := routes[index]
+		if selected.Disabled {
 			return nil, fmt.Errorf("route is currently marked disabled by GW2 API discovery")
+		}
+		if in.Offset < 0 {
+			return nil, fmt.Errorf("offset must be nonnegative")
 		}
 		path, err := substituteRoute(route, in.PathParams)
 		if err != nil {
 			return nil, err
 		}
-		query, err := validateAPIQuery(*selected, in)
+		query, err := validateAPIQuery(selected, in)
 		if err != nil {
 			return nil, err
 		}
@@ -73,21 +137,61 @@ func registerAPITools(server *mcp.Server, api apiReader) {
 			path += "?" + encoded
 		}
 		response, err := api.ReadRoute(ctx, path, selected.RequiresAuth)
+		if gw2.IsNoValidIDs(err) && len(in.IDs) > 0 {
+			response, err = gw2.APIResponse{Data: json.RawMessage("[]"), ObservedAt: time.Now().UTC(), Partial: true}, nil
+		}
 		if err != nil {
 			return nil, err
 		}
-		result := map[string]any{
-			"endpoint": response.Endpoint, "observed_at": response.ObservedAt.Format(time.RFC3339),
-			"request": path, "data": response.Data, "partial": response.Partial,
+		result := apiQueryResult{Request: path, ObservedAt: response.ObservedAt.Format(time.RFC3339), Partial: response.Partial}
+		if len(in.IDs) == 0 {
+			result.Pagination = response.Pagination
 		}
-		if response.StatusCode != 0 {
-			result["status_code"] = response.StatusCode
-		}
-		if response.Pagination != nil {
-			result["pagination"] = response.Pagination
-		}
-		return result, nil
+		result.Data, result.Total, result.NextOffset, err = shapeData(response.Data, in.Fields, in.Offset)
+		return result, err
 	})
+}
+
+func shapeData(data json.RawMessage, fields []string, offset int) (any, int, int, error) {
+	var rows []json.RawMessage
+	if json.Unmarshal(data, &rows) != nil {
+		data = selectFields(data, fields)
+		if len(data) > maxObjectChars {
+			return nil, 0, 0, fmt.Errorf("response is %d characters; request fewer fields or a narrower route", len(data))
+		}
+		return data, 0, 0, nil
+	}
+	if offset > len(rows) {
+		return nil, 0, 0, fmt.Errorf("offset exceeds the %d returned elements", len(rows))
+	}
+	kept, size := []json.RawMessage{}, 0
+	for _, row := range rows[offset:] {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, selectFields(row, fields)); err != nil {
+			return nil, 0, 0, err
+		}
+		if compact.Len() > maxObjectChars {
+			return nil, 0, 0, fmt.Errorf("one element is %d characters; request fewer fields or a narrower route", compact.Len())
+		}
+		if size += compact.Len() + 1; size > maxDataChars && len(kept) > 0 {
+			return kept, len(rows), offset + len(kept), nil
+		}
+		kept = append(kept, compact.Bytes())
+	}
+	if offset > 0 {
+		return kept, len(rows), 0, nil
+	}
+	return kept, 0, 0, nil
+}
+
+func selectFields(data json.RawMessage, fields []string) json.RawMessage {
+	var object map[string]json.RawMessage
+	if len(fields) == 0 || json.Unmarshal(data, &object) != nil || object == nil {
+		return data
+	}
+	maps.DeleteFunc(object, func(key string, _ json.RawMessage) bool { return !slices.Contains(fields, key) })
+	selected, _ := encodeJSON(object)
+	return selected
 }
 
 func discoverRoutes(ctx context.Context, api apiReader) ([]apiRoute, error) {
@@ -95,34 +199,28 @@ func discoverRoutes(ctx context.Context, api apiReader) ([]apiRoute, error) {
 	if err != nil {
 		return nil, err
 	}
-	text := strings.TrimSpace(string(catalog))
-	if text == "" || text == "null" {
-		return nil, fmt.Errorf("GW2 API discovery response contained no routes")
-	}
 	routes := make(map[string]apiRoute)
 	add := func(route apiRoute) {
 		current := routes[route.Route]
 		current.Route = route.Route
 		current.RequiresAuth = current.RequiresAuth || route.RequiresAuth
 		current.LocaleAware = current.LocaleAware || route.LocaleAware
-		current.CurrentlyDisabled = current.CurrentlyDisabled || route.CurrentlyDisabled
+		current.Disabled = current.Disabled || route.Disabled
 		routes[route.Route] = current
 	}
-	for _, line := range strings.Split(text, "\n") {
+	for _, line := range strings.Split(string(catalog), "\n") {
 		if route, ok := parseDiscoveryLine(line); ok && route.Route != "createsubtoken" {
 			add(route)
 		}
 	}
-	for parent, children := range map[string][]apiRoute{
-		"commerce/exchange": {{Route: "coins"}, {Route: "gems"}},
-		"commerce/transactions": {
-			{Route: "current/buys", RequiresAuth: true}, {Route: "current/sells", RequiresAuth: true},
-			{Route: "history/buys", RequiresAuth: true}, {Route: "history/sells", RequiresAuth: true},
-		},
+	for parent, children := range map[string][]string{
+		"commerce/exchange":     {"coins", "gems"},
+		"commerce/transactions": {"current/buys", "current/sells", "history/buys", "history/sells"},
+		"emblem":                {"foregrounds", "backgrounds"},
 	} {
-		if _, exists := routes[parent]; exists {
+		if route, exists := routes[parent]; exists {
 			for _, child := range children {
-				add(apiRoute{Route: parent + "/" + child.Route, RequiresAuth: child.RequiresAuth})
+				add(apiRoute{Route: parent + "/" + child, RequiresAuth: route.RequiresAuth})
 			}
 		}
 	}
@@ -139,9 +237,8 @@ func discoverRoutes(ctx context.Context, api apiReader) ([]apiRoute, error) {
 
 func normalizeAPIRoute(route string) string {
 	route = strings.TrimSpace(route)
-	route = strings.TrimPrefix(route, "/v2/")
 	route = strings.TrimPrefix(route, "/")
-	return route
+	return strings.TrimPrefix(route, "v2/")
 }
 
 var discoveryRoutePattern = regexp.MustCompile(`^[A-Za-z0-9_:-]+(?:/[A-Za-z0-9_:-]+)*$`)
@@ -164,7 +261,7 @@ func parseDiscoveryLine(line string) (apiRoute, bool) {
 			case "l":
 				entry.LocaleAware = true
 			case "d":
-				entry.CurrentlyDisabled = true
+				entry.Disabled = true
 			}
 		}
 	}
@@ -202,8 +299,8 @@ func validateAPIQuery(route apiRoute, in apiQueryInput) (url.Values, error) {
 	if len(in.IDs) > 0 {
 		seen := make(map[string]struct{}, len(in.IDs))
 		for _, id := range in.IDs {
-			if id == "" || len(id) > 128 || id != strings.TrimSpace(id) || strings.EqualFold(id, "all") || strings.ContainsAny(id, ",/?#\\%") {
-				return nil, fmt.Errorf("ids must be nonempty individual IDs; ids=all and comma-separated values are not allowed")
+			if id == "" || len(id) > 128 || id != strings.TrimSpace(id) || strings.ContainsAny(id, ",/?#\\%") {
+				return nil, fmt.Errorf("ids must be nonempty individual IDs, one per array element")
 			}
 			if _, exists := seen[id]; exists {
 				return nil, fmt.Errorf("ids must be unique")
@@ -273,7 +370,7 @@ func validateFilter(route, key, value string) error {
 		min, max = 1, 1_000_000_000_000
 	case (key == "input" || key == "output") && route == "recipes/search":
 		min, max = 1, int64(^uint64(0)>>1)
-	case key == "since" && (strings.HasPrefix(route, "commerce/transactions/history/") || route == "guild/:id/log"):
+	case key == "since" && route == "guild/:id/log":
 		min, max = 0, int64(^uint64(0)>>1)
 	default:
 		return fmt.Errorf("filter %q is not supported for route %q", key, route)

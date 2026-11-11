@@ -19,6 +19,8 @@ Raw measurements and fixture details are in [benchmarks/serial.txt](benchmarks/s
 
 The structural refactor retained the performance behavior: median overview **20.53 ms**, complex inventory **101.48 ms**, with the same 20 ms simulated request latency, expected results, and 3/14 requests per operation. See [benchmarks/refactor.txt](benchmarks/refactor.txt). The simplified fixture now prebuilds its fixed response bodies, so allocation counts should not be used to claim application memory improvements against the older fixture.
 
+The overview now also resolves wallet currency names: one extra public request on first use, cached afterwards.
+
 ## Live network check
 
 The serial source snapshots were also built into a separate executable and compared through the same MCP protocol, using real account reads and alternating execution order after warmup.

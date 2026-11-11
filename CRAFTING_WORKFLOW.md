@@ -10,7 +10,7 @@ This is an analysis workflow for an MCP host using the server's composable tools
 
 ## Required inputs and coverage
 
-Resolve names to verified item IDs, then verify metadata with `get_items`. Do not download the full catalog. Use `search_recipes` and `get_recipes` for API recipe stages, and source-backed external data for acquisition stages not returned by the API, including Mystic Forge steps and vendors. An empty recipe search is not proof that an item cannot be crafted or has zero cost.
+Resolve names to item IDs with `search_wiki`, then verify metadata with `get_items`. Do not download the full catalog. Use `search_recipes` and `get_recipes` for API recipe stages, and source-backed external data for acquisition stages not returned by the API, including Mystic Forge steps and vendors. An empty recipe search is not proof that an item cannot be crafted or has zero cost.
 
 Search both final items and intermediate gifts/precursors before expanding missing quantities. An owned intermediate replaces its ingredients; do not also charge its full ingredient tree. Respect recipe output counts, batch rounding, alternate recipes, deterministic versus random yields, purchase limits, and account-bound requirements. Do not assume random outputs are guaranteed.
 
@@ -35,7 +35,7 @@ Track balances after every stage. The maximum cash deficit across the sequence i
 
 Evaluate direct crafting under two procurement policies: instant buy and standing buy orders. For each, evaluate the indirect route under instant Fang sale and a standing Fang listing, producing four indirect scenarios. If finished-Weight purchase is requested, show it as a separate route family.
 
-Use `get_market_prices` for benchmarks, and `quote_trade` for quantity-aware instant fills and seller fee estimates. Standing quotes require an explicit unit price: state the observed reference and chosen price, never silently assume an order fills. Use the same procurement and opportunity-value policy across routes being compared. Quotes from separate calls may change and do not reserve liquidity.
+Use `get_market_prices` for benchmarks, and `quote_trades` for quantity-aware instant fills and seller fee estimates. Standing quotes require an explicit unit price: state the observed reference and chosen price, never silently assume an order fills. Use the same procurement and opportunity-value policy across routes being compared. Quotes from separate calls may change and do not reserve liquidity.
 
 Never extrapolate beyond observed depth. An unfilled instant quote leaves an unresolved procurement or sale quantity, not a fully costed plan. Standing orders/listings remain conditional on filling and have no guaranteed completion time. Retain fee-rounding uncertainty. Check that Fang remains sellable before any account-binding action; public item metadata cannot certify the binding state of an owned instance.
 

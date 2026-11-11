@@ -26,14 +26,14 @@ This audit follows the public navigation on [gw2efficiency.com](https://gw2effic
 | Account: Farming | `earning_route_review` can compare sourced rewards and marketable items. No automatic farm route or unverified drop-rate/gold-per-hour model. |
 | Account: Time Machine | Public/current account data can be analyzed against caller-captured local records. Historical datasets held privately by gw2efficiency are excluded; current reads cannot recreate past account state. |
 | Account: Wallet | Typed `account_overview`; `get_currencies` resolves currency metadata. `currency_conversion_review` checks sourced exchange/vendor/reward options without assigning unsupported values. |
-| Account: Bank | Typed `find_item`/`find_items` search bank alongside their other defined sources. Failures are reported and totals may be lower bounds. |
-| Account: Material Storage | Typed `find_item`/`find_items` includes material storage. It does not show every account-held item source. |
-| Account: Shared Inventory | Typed `find_item`/`find_items` includes shared inventory. |
+| Account: Bank | Typed `find_items` search bank alongside their other defined sources. Failures are reported and totals may be lower bounds. |
+| Account: Material Storage | Typed `find_items` includes material storage. It does not show every account-held item source. |
+| Account: Shared Inventory | Typed `find_items` includes shared inventory. |
 | Account: Wardrobe | API read for unlock endpoints where available; not a rendered wardrobe or a complete owned-item inventory. |
 | Account: Miniatures | API read for unlock endpoints where available; no mini collection scoring. |
 | Account: Mounts | API read for unlocks where available; no mount progression planner. |
 | Account: Dyes | API read for unlocks where available; no complete dye collection valuation. |
-| Account: Recipes | Typed `search_recipes`, `get_recipes`, and `get_account_recipes`; recipe definitions, account unlock IDs, and current character craftability remain distinct. |
+| Account: Recipes | Typed `search_recipes`, `get_recipes`, and `get_account_recipes`; recipe definitions, account unlocks for the checked recipe IDs, and current character craftability remain distinct. |
 | Account: PvP Heroes | API read only where relevant endpoints exist. Site-specific hero completion/score is not established. |
 | Account: Mailcarriers | API read for unlocks where available. |
 | Account: Outfits | API read for unlocks where available. |
@@ -61,10 +61,10 @@ This audit follows the public navigation on [gw2efficiency.com](https://gw2effic
 | Currency: Guild Commendations | `account_overview` reads wallet; `currency_conversion_review` can compare sourced routes and listed costs/limits. |
 | Currency: Claim Tickets | `account_overview` reads wallet; `currency_conversion_review` can compare sourced routes and listed costs/limits. |
 | Currency: Exchange and conversion routes | `query_api` supports `commerce/exchange/coins` and `commerce/exchange/gems`; `currency_conversion_review` covers sourced vendor, reward, or item-mediated routes. No universal currency-to-gold table. |
-| Tradingpost: Overview | Typed `get_market_prices`, `quote_trade`, and `quote_trades` cover public current prices/depth. Account orders and delivery are separate reads. |
+| Tradingpost: Overview | Typed `get_market_prices` and `quote_trades` cover public current prices/depth. Account orders and delivery are separate reads. |
 | Tradingpost: Delivery Box | `trading_post_review` can query account delivery only where the discovered route and key permission allow it. The server cannot collect delivery. |
 | Tradingpost: Current Transactions | `trading_post_review` can query `commerce/transactions/current/buys` and `/sells` with required permission. It does not normalize a site portfolio view. |
-| Tradingpost: Transaction History | `trading_post_review` can query `commerce/transactions/history/buys` and `/sells` with `since` and pagination. Missing history is not reconstructed from current state. |
+| Tradingpost: Transaction History | `trading_post_review` can query `commerce/transactions/history/buys` and `/sells` with pagination; the API keeps about 90 days. Missing history is not reconstructed from current state. |
 | Tradingpost: Investment History | No built-in investment ledger. `trading_post_review` can reconcile available transaction history; site-specific profit accounting is not implemented. |
 | Timers | `scenario_workbench` can read current public timer/event routes returned by endpoint discovery; cite the route and `observed_at`. No background polling, notifications, or reset guarantees. |
 | Instances: Fractals | API read for exposed progress/unlocks; reward expectations and rotations need current source evidence. |

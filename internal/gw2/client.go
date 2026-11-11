@@ -3,11 +3,13 @@ package gw2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,21 +19,28 @@ const defaultBaseURL = "https://api.guildwars2.com"
 const schemaVersion = "2025-08-29T01:00:00.000Z"
 const maxResponseBytes = 4 << 20
 
+type Pagination struct {
+	PageSize    int `json:"page_size,omitempty"`
+	PageTotal   int `json:"page_total,omitempty"`
+	ResultCount int `json:"result_count,omitempty"`
+	ResultTotal int `json:"result_total,omitempty"`
+}
+
 type APIResponse struct {
-	Data       json.RawMessage   `json:"data"`
-	Endpoint   string            `json:"endpoint"`
-	ObservedAt time.Time         `json:"observed_at"`
-	StatusCode int               `json:"status_code"`
-	Partial    bool              `json:"partial"`
-	Pagination map[string]string `json:"pagination,omitempty"`
+	Data       json.RawMessage
+	ObservedAt time.Time
+	Partial    bool
+	Pagination *Pagination
 }
 
 type Client struct {
 	key        string
 	baseURL    string
 	httpClient *http.Client
+	retryDelay time.Duration
 	mu         sync.Mutex
 	items      map[int]Item
+	currencies []Currency
 }
 
 func NewClient(key string) *Client {
@@ -44,12 +53,13 @@ func NewClient(key string) *Client {
 				return http.ErrUseLastResponse
 			},
 		},
-		items: make(map[int]Item),
+		retryDelay: time.Second,
+		items:      make(map[int]Item),
 	}
 }
 
 func (c *Client) Get(ctx context.Context, path string, out any) error {
-	response, err := c.request(ctx, path, false, false)
+	response, err := c.request(ctx, path, false)
 	if err != nil {
 		return err
 	}
@@ -59,20 +69,46 @@ func (c *Client) Get(ctx context.Context, path string, out any) error {
 	return nil
 }
 
+func (c *Client) GetByIDs(ctx context.Context, route string, ids []int, out any) error {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.Itoa(id)
+	}
+	err := c.Get(ctx, route+"?ids="+strings.Join(parts, ","), out)
+	if IsNoValidIDs(err) {
+		return nil
+	}
+	return err
+}
+
 func (c *Client) GetRaw(ctx context.Context, path string) ([]byte, error) {
-	response, err := c.request(ctx, path, false, false)
+	response, err := c.request(ctx, path, false)
 	return response.Data, err
 }
 
 func (c *Client) ReadRoute(ctx context.Context, path string, authenticated bool) (APIResponse, error) {
-	response, err := c.request(ctx, path, true, authenticated)
+	response, err := c.request(ctx, path, authenticated)
 	if err == nil && !json.Valid(response.Data) {
 		return APIResponse{}, fmt.Errorf("GW2 API returned invalid JSON")
 	}
 	return response, err
 }
 
-func (c *Client) request(ctx context.Context, path string, allowPartial, authenticated bool) (APIResponse, error) {
+type StatusError struct {
+	Code    int
+	Message string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("GW2 API returned HTTP %d: %s", e.Code, e.Message)
+}
+
+func IsNoValidIDs(err error) bool {
+	var status *StatusError
+	return errors.As(err, &status) && status.Code == http.StatusNotFound && strings.Contains(status.Message, "all ids provided are invalid")
+}
+
+func (c *Client) request(ctx context.Context, path string, authenticated bool) (APIResponse, error) {
 	path = strings.TrimPrefix(path, "/")
 	if path == "" {
 		return APIResponse{}, fmt.Errorf("invalid API path")
@@ -98,29 +134,48 @@ func (c *Client) request(ctx context.Context, path string, allowPartial, authent
 	if err != nil || u.Host == "" {
 		return APIResponse{}, fmt.Errorf("invalid API path")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return APIResponse{}, c.safe(err)
+	useKey := authenticated || privatePath(parsedPath.Path)
+	if useKey && strings.TrimSpace(c.key) == "" {
+		return APIResponse{}, fmt.Errorf("GW2 API key is required for this endpoint")
 	}
-	req.Header.Set("Accept", "application/json")
-	if authenticated || privatePath(parsedPath.Path) {
-		if strings.TrimSpace(c.key) == "" {
-			return APIResponse{}, fmt.Errorf("GW2 API key is required for this endpoint")
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return APIResponse{}, c.safe(err)
 		}
-		req.Header.Set("Authorization", "Bearer "+c.key)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return APIResponse{}, c.safe(err)
+		req.Header.Set("Accept", "application/json")
+		if useKey {
+			req.Header.Set("Authorization", "Bearer "+c.key)
+		}
+		resp, err = c.httpClient.Do(req)
+		if err != nil {
+			return APIResponse{}, c.safe(err)
+		}
+		if attempt > 0 || !transient(resp.StatusCode) {
+			break
+		}
+		resp.Body.Close()
+		select {
+		case <-ctx.Done():
+			return APIResponse{}, c.safe(ctx.Err())
+		case <-time.After(c.retryDelay):
+		}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && !(allowPartial && resp.StatusCode == http.StatusPartialContent) {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		var payload struct {
+			Text string `json:"text"`
+		}
 		msg := strings.TrimSpace(string(body))
+		if json.Unmarshal(body, &payload) == nil && payload.Text != "" {
+			msg = payload.Text
+		}
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
-		return APIResponse{}, fmt.Errorf("GW2 API returned HTTP %d: %s", resp.StatusCode, c.redact(msg))
+		return APIResponse{}, &StatusError{Code: resp.StatusCode, Message: c.redact(msg)}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
@@ -129,16 +184,24 @@ func (c *Client) request(ctx context.Context, path string, allowPartial, authent
 	if len(body) > maxResponseBytes {
 		return APIResponse{}, fmt.Errorf("GW2 API response exceeds %d bytes; use smaller pages", maxResponseBytes)
 	}
-	result := APIResponse{Data: body, Endpoint: "/" + parsedPath.EscapedPath(), ObservedAt: time.Now().UTC(), StatusCode: resp.StatusCode, Partial: resp.StatusCode == http.StatusPartialContent}
-	for _, name := range []string{"X-Page-Size", "X-Page-Total", "X-Result-Count", "X-Result-Total", "Link"} {
-		if value := resp.Header.Get(name); value != "" {
-			if result.Pagination == nil {
-				result.Pagination = make(map[string]string)
-			}
-			result.Pagination[name] = value
-		}
+	result := APIResponse{Data: body, ObservedAt: time.Now().UTC(), Partial: resp.StatusCode == http.StatusPartialContent}
+	page := Pagination{
+		PageSize: headerInt(resp, "X-Page-Size"), PageTotal: headerInt(resp, "X-Page-Total"),
+		ResultCount: headerInt(resp, "X-Result-Count"), ResultTotal: headerInt(resp, "X-Result-Total"),
+	}
+	if page != (Pagination{}) {
+		result.Pagination = &page
 	}
 	return result, nil
+}
+
+func transient(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+func headerInt(resp *http.Response, name string) int {
+	value, _ := strconv.Atoi(resp.Header.Get(name))
+	return value
 }
 
 func privatePath(path string) bool {
@@ -165,42 +228,74 @@ func (c *Client) safe(err error) error {
 }
 
 type Overview struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	Permissions []string      `json:"permissions"`
-	Wallet      []WalletEntry `json:"wallet"`
+	Account     json.RawMessage `json:"account"`
+	Permissions []string        `json:"permissions"`
+	Wallet      []WalletEntry   `json:"wallet"`
 }
 type WalletEntry struct {
-	ID    int   `json:"id"`
-	Value int64 `json:"value"`
+	ID    int    `json:"id"`
+	Name  string `json:"name,omitempty"`
+	Value int64  `json:"value"`
+}
+type Currency struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 func (c *Client) Overview(ctx context.Context) (Overview, error) {
 	var result Overview
-	var account struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
 	var token struct {
 		Permissions []string `json:"permissions"`
 	}
+	var currencies []Currency
 	paths := []string{"v2/account", "v2/tokeninfo", "v2/account/wallet"}
-	targets := []any{&account, &token, &result.Wallet}
-	errors := make([]error, len(paths))
-	parallel(len(paths), func(i int) { errors[i] = c.Get(ctx, paths[i], targets[i]) })
-	for _, err := range errors {
+	targets := []any{&result.Account, &token, &result.Wallet}
+	errs := make([]error, len(paths)+1)
+	Parallel(len(errs), func(i int) {
+		if i == len(paths) {
+			currencies, errs[i] = c.Currencies(ctx)
+			return
+		}
+		errs[i] = c.Get(ctx, paths[i], targets[i])
+	})
+	for _, err := range errs[:len(paths)] {
 		if err != nil {
 			return Overview{}, err
 		}
 	}
-	result.ID, result.Name, result.Permissions = account.ID, account.Name, token.Permissions
+	names := make(map[int]string, len(currencies))
+	for _, currency := range currencies {
+		names[currency.ID] = currency.Name
+	}
+	for i := range result.Wallet {
+		result.Wallet[i].Name = names[result.Wallet[i].ID]
+	}
+	result.Permissions = token.Permissions
 	if result.Wallet == nil {
 		result.Wallet = []WalletEntry{}
 	}
 	return result, nil
 }
 
-func parallel(n int, run func(int)) {
+func (c *Client) Currencies(ctx context.Context) ([]Currency, error) {
+	c.mu.Lock()
+	cached := c.currencies
+	c.mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+	var fetched []Currency
+	if err := c.Get(ctx, "v2/currencies?ids=all", &fetched); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.currencies = fetched
+	c.mu.Unlock()
+	return fetched, nil
+}
+
+func Parallel(n int, run func(int)) {
 	jobs := make(chan int, n)
 	for i := range n {
 		jobs <- i
@@ -230,23 +325,32 @@ func (c *Client) Characters(ctx context.Context) ([]string, error) {
 type Item struct {
 	ID          int      `json:"id"`
 	Name        string   `json:"name"`
-	Description string   `json:"description"`
+	Description string   `json:"description,omitempty"`
 	Type        string   `json:"type"`
 	Rarity      string   `json:"rarity"`
-	Flags       []string `json:"flags"`
+	Level       int      `json:"level,omitempty"`
+	VendorValue int64    `json:"vendor_value,omitempty"`
+	Flags       []string `json:"flags,omitempty"`
 }
 
-func (c *Client) Items(ctx context.Context, ids []int) ([]Item, error) {
+func UniqueIDs(ids []int, field string) ([]int, error) {
 	if len(ids) < 1 || len(ids) > 200 {
-		return nil, fmt.Errorf("item_ids must contain 1 to 200 IDs")
+		return nil, fmt.Errorf("%s must contain 1 to 200 IDs", field)
 	}
 	unique := slices.Clone(ids)
 	slices.Sort(unique)
 	unique = slices.Compact(unique)
 	if unique[0] <= 0 {
-		return nil, fmt.Errorf("item IDs must be positive")
+		return nil, fmt.Errorf("%s must be positive", field)
 	}
+	return unique, nil
+}
 
+func (c *Client) Items(ctx context.Context, ids []int) ([]Item, error) {
+	unique, err := UniqueIDs(ids, "item_ids")
+	if err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	missing := make([]int, 0, len(unique))
 	for _, id := range unique {
@@ -256,32 +360,23 @@ func (c *Client) Items(ctx context.Context, ids []int) ([]Item, error) {
 	}
 	c.mu.Unlock()
 	if len(missing) > 0 {
-		parts := make([]string, len(missing))
-		for i, id := range missing {
-			parts[i] = fmt.Sprint(id)
-		}
 		var fetched []Item
-		if err := c.Get(ctx, "v2/items?ids="+strings.Join(parts, ","), &fetched); err != nil {
+		if err := c.GetByIDs(ctx, "v2/items", missing, &fetched); err != nil {
 			return nil, err
 		}
 		c.mu.Lock()
 		for _, item := range fetched {
-			if _, requested := slices.BinarySearch(unique, item.ID); requested {
-				c.items[item.ID] = item
-			}
+			c.items[item.ID] = item
 		}
 		c.mu.Unlock()
 	}
-
 	out := make([]Item, 0, len(unique))
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, id := range unique {
-		item, ok := c.items[id]
-		if !ok {
-			return nil, fmt.Errorf("item %d was not returned by the API", id)
+		if item, ok := c.items[id]; ok {
+			out = append(out, item)
 		}
-		out = append(out, item)
 	}
 	return out, nil
 }

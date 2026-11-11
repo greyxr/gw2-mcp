@@ -27,6 +27,7 @@ func newPerformanceClient() (*Client, *performanceFixture) {
 		"/v2/account/bank":      `[{"id":1001,"count":2}]`,
 		"/v2/account/materials": `[{"id":1001,"count":3}]`,
 		"/v2/account/inventory": `[{"id":1001,"count":4}]`,
+		"/v2/currencies":        `[{"id":1,"name":"Coin"}]`,
 	}
 	names := make([]string, 10)
 	for i := range names {
@@ -38,7 +39,7 @@ func newPerformanceClient() (*Client, *performanceFixture) {
 	client := testClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		time.Sleep(performanceDelay)
 		fixture.requests.Add(1)
-		if req.Header.Get("Authorization") != "Bearer "+performanceAPIKey {
+		if (req.Header.Get("Authorization") == "Bearer "+performanceAPIKey) == (req.URL.Path == "/v2/currencies") {
 			fixture.authErrors.Add(1)
 		}
 		body, ok := bodies[req.URL.Path]
@@ -62,8 +63,8 @@ func BenchmarkAccountOverview(b *testing.B) {
 		check(b, err == nil, "%v", err)
 	}
 	b.StopTimer()
-	check(b, result.ID == "acc-1" && result.Name == "Benchmark" && len(result.Permissions) == 1 && len(result.Wallet) == 1 && result.Wallet[0].Value == 20, "incorrect overview result: %+v", result)
-	check(b, fixture.requests.Load() == int64(b.N*3) && fixture.authErrors.Load() == 0, "unexpected request count or authentication")
+	check(b, len(result.Account) > 0 && len(result.Permissions) == 1 && len(result.Wallet) == 1 && result.Wallet[0] == WalletEntry{1, "Coin", 20}, "incorrect overview result: %+v", result)
+	check(b, fixture.requests.Load() == int64(b.N*3+1) && fixture.authErrors.Load() == 0, "unexpected request count or authentication")
 }
 
 func BenchmarkFindItemsComplex(b *testing.B) {
@@ -78,6 +79,6 @@ func BenchmarkFindItemsComplex(b *testing.B) {
 		check(b, err == nil, "%v", err)
 	}
 	b.StopTimer()
-	check(b, result.Complete && len(result.Items) == 1 && result.Items[0].ItemID == 1001 && result.Items[0].ObservedTotal == 64 && len(result.Items[0].Locations) == 13 && len(result.Sources) == 14, "incorrect inventory result: %+v", result)
+	check(b, result.Complete && len(result.Items) == 1 && result.Items[0].ItemID == 1001 && result.Items[0].Total == 64 && len(result.Items[0].Locations) == 13 && result.SourcesChecked == 13, "incorrect inventory result: %+v", result)
 	check(b, fixture.requests.Load() == int64(b.N*14) && fixture.authErrors.Load() == 0, "unexpected request count or authentication")
 }
