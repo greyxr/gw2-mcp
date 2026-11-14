@@ -27,7 +27,7 @@ func New(api *gw2.Client) *mcp.Server {
 	registerWorkflowPrompt(s)
 	registerAPITools(s, api)
 	registerRecordTools(s)
-	registerReferenceTools(s)
+	registerWikiTools(s)
 	addRead(s, "account_overview", "Account details, API key permissions, and wallet with currency names (coin in copper).", func(ctx context.Context, _ struct{}) (any, error) { return api.Overview(ctx) })
 	addRead(s, "list_characters", "List account character names.", func(ctx context.Context, _ struct{}) (any, error) { return api.Characters(ctx) })
 	addRead(s, "get_character_crafting", "Crafting disciplines, ratings, and active status for one character.", func(ctx context.Context, in struct {

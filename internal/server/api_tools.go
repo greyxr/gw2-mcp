@@ -293,91 +293,61 @@ func substituteRoute(route string, params map[string]string) (string, error) {
 
 func validateAPIQuery(route apiRoute, in apiQueryInput) (url.Values, error) {
 	query := url.Values{}
-	if len(in.IDs) > 200 {
-		return nil, fmt.Errorf("ids must contain at most 200 values")
+	if len(in.IDs) > 200 || len(in.IDs) > 0 && in.Page != nil {
+		return nil, fmt.Errorf("ids takes at most 200 values and cannot be combined with page")
+	}
+	for _, id := range in.IDs {
+		if id == "" || len(id) > 128 || strings.ContainsAny(id, " ,/?#\\%") {
+			return nil, fmt.Errorf("ids must be individual IDs, one per array element")
+		}
 	}
 	if len(in.IDs) > 0 {
-		seen := make(map[string]struct{}, len(in.IDs))
-		for _, id := range in.IDs {
-			if id == "" || len(id) > 128 || id != strings.TrimSpace(id) || strings.ContainsAny(id, ",/?#\\%") {
-				return nil, fmt.Errorf("ids must be nonempty individual IDs, one per array element")
-			}
-			if _, exists := seen[id]; exists {
-				return nil, fmt.Errorf("ids must be unique")
-			}
-			seen[id] = struct{}{}
-		}
 		query.Set("ids", strings.Join(in.IDs, ","))
 	}
 	if in.Page != nil {
-		if *in.Page < 0 || *in.Page > 100000 {
-			return nil, fmt.Errorf("page must be between 0 and 100000")
+		if *in.Page < 0 {
+			return nil, fmt.Errorf("page must be nonnegative")
 		}
-		query.Set("page", fmt.Sprint(*in.Page))
+		query.Set("page", strconv.Itoa(*in.Page))
 	}
 	if in.PageSize != nil {
 		if *in.PageSize < 1 || *in.PageSize > 200 {
 			return nil, fmt.Errorf("page_size must be between 1 and 200")
 		}
-		query.Set("page_size", fmt.Sprint(*in.PageSize))
-	}
-	if len(in.IDs) > 0 && in.Page != nil {
-		return nil, fmt.Errorf("ids and page cannot be used together")
+		query.Set("page_size", strconv.Itoa(*in.PageSize))
 	}
 	if in.Lang != "" {
-		if !route.LocaleAware {
-			return nil, fmt.Errorf("lang is only valid on locale-aware routes")
-		}
-		switch in.Lang {
-		case "en", "de", "es", "fr", "zh":
-		default:
-			return nil, fmt.Errorf("lang must be en, de, es, fr, or zh")
+		if !route.LocaleAware || !slices.Contains([]string{"en", "de", "es", "fr", "zh"}, in.Lang) {
+			return nil, fmt.Errorf("lang must be en, de, es, fr, or zh on a route marked [l]")
 		}
 		query.Set("lang", in.Lang)
 	}
 	for key, value := range in.Filters {
-		if err := validateFilter(route.Route, key, value); err != nil {
-			return nil, err
+		if !slices.Contains(routeFilters(route.Route), key) {
+			return nil, fmt.Errorf("filter %q is not supported for route %q", key, route.Route)
+		}
+		if value == "" || len(value) > 256 || key != "name" && !numericFilter.MatchString(value) {
+			return nil, fmt.Errorf("filter %q must be a number", key)
 		}
 		query.Set(key, value)
-	}
-	if route.Route == "guild/search" && query.Get("name") == "" {
-		return nil, fmt.Errorf("guild/search requires filters.name")
-	}
-	if route.Route == "recipes/search" && (query.Get("input") == "") == (query.Get("output") == "") {
-		return nil, fmt.Errorf("recipes/search requires exactly one of filters.input or filters.output")
-	}
-	if route.Route == "commerce/exchange/coins" || route.Route == "commerce/exchange/gems" {
-		if query.Get("quantity") == "" {
-			return nil, fmt.Errorf("exchange routes require filters.quantity")
-		}
 	}
 	return query, nil
 }
 
-func validateFilter(route, key, value string) error {
-	if value == "" || len(value) > 256 {
-		return fmt.Errorf("filter %q must be between 1 and 256 characters", key)
-	}
-	if key == "name" && route == "guild/search" {
-		return nil
-	}
-	var min, max int64
+var numericFilter = regexp.MustCompile(`^[0-9]{1,18}$`)
+
+func routeFilters(route string) []string {
 	switch {
-	case key == "world" && (route == "wvw/matches" || strings.HasPrefix(route, "wvw/matches/")):
-		min, max = 1, int64(^uint64(0)>>1)
-	case key == "quantity" && (route == "commerce/exchange/coins" || route == "commerce/exchange/gems"):
-		min, max = 1, 1_000_000_000_000
-	case (key == "input" || key == "output") && route == "recipes/search":
-		min, max = 1, int64(^uint64(0)>>1)
-	case key == "since" && route == "guild/:id/log":
-		min, max = 0, int64(^uint64(0)>>1)
-	default:
-		return fmt.Errorf("filter %q is not supported for route %q", key, route)
-	}
-	number, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || number < min || number > max {
-		return fmt.Errorf("filter %q must be a numeric value between %d and %d", key, min, max)
+	case route == "guild/search":
+		return []string{"name"}
+	case route == "guild/:id/log":
+		return []string{"since"}
+	case route == "recipes/search":
+		return []string{"input", "output"}
+	case strings.HasPrefix(route, "commerce/exchange/"):
+		return []string{"quantity"}
+	case strings.HasPrefix(route, "wvw/matches"):
+		return []string{"world"}
 	}
 	return nil
 }
