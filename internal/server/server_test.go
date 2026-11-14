@@ -19,25 +19,25 @@ func (f testTransport) RoundTrip(r *http.Request) (*http.Response, error) { retu
 func apiFixture(t *testing.T) *gw2.Client {
 	t.Helper()
 	bodies := map[string]string{
-		"/v2":                           "Public API\n /v2/items [l]\n /v2/account [a]",
-		"/v2/account":                   `{"id":"account","name":"Test"}`,
+		"/v2":                           "Public API\n /v2/items [l]\n /v2/account [a]\n /v2/events [l,d]",
+		"/v2/account":                   `{"id":"account","name":"Test","world":1001}`,
 		"/v2/tokeninfo":                 `{"permissions":["inventories"]}`,
 		"/v2/account/wallet":            `[{"id":1,"value":99}]`,
 		"/v2/characters":                `["Hero"]`,
-		"/v2/account/bank":              `[{"id":7,"count":2}]`,
+		"/v2/account/bank":              `[null,{"id":7,"count":2}]`,
 		"/v2/account/materials":         `[]`,
 		"/v2/account/inventory":         `[]`,
-		"/v2/characters/Hero/inventory": `{"bags":[]}`,
+		"/v2/characters/Hero/inventory": `{"bags":[null,{"inventory":[null,{"id":7,"count":1}]}]}`,
 		"/v2/characters/Hero/crafting":  `{"crafting":[{"discipline":"Artificer","rating":400,"active":true}]}`,
-		"/v2/items":                     `[{"id":7,"name":"Test item","flags":[]}]`,
-		"/v2/currencies":                `[{"id":1,"name":"Coin"}]`,
+		"/v2/items":                     `[{"id":7,"name":"Test & item","flags":[]}]`,
+		"/v2/currencies":                `[{"id":1,"name":"Coin","icon":"x"},{"id":2,"name":"Karma"}]`,
 		"/v2/recipes/search":            `[42]`,
-		"/v2/recipes":                   `[{"id":42,"output_item_id":7,"output_item_count":1}]`,
+		"/v2/recipes":                   `[{"id":42,"output_item_id":7,"output_item_count":1,"ingredients":[{"type":"Item","id":7,"count":2},{"type":"Currency","id":1,"count":5}],"chat_link":"x"}]`,
 		"/v2/account/recipes":           `[42]`,
 		"/v2/commerce/prices":           `[{"id":7,"buys":{"unit_price":100,"quantity":3},"sells":{"unit_price":120,"quantity":3}}]`,
 		"/v2/commerce/listings":         `[{"id":7,"buys":[{"quantity":3,"unit_price":100}],"sells":[{"quantity":3,"unit_price":120}]}]`,
-		"/wiki/Test":                    "public guide",
 	}
+	partial := map[string]bool{"/v2/items": true, "/v2/recipes": true, "/v2/commerce/prices": true, "/v2/commerce/listings": true}
 	var authErrors atomic.Int64
 	original := http.DefaultTransport
 	http.DefaultTransport = testTransport(func(r *http.Request) (*http.Response, error) {
@@ -49,7 +49,11 @@ func apiFixture(t *testing.T) *gw2.Client {
 		if !ok {
 			return nil, fmt.Errorf("unexpected fixture route %s", r.URL.Path)
 		}
-		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/plain"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		status := 200
+		if partial[r.URL.Path] && strings.Contains(r.URL.Query().Get("ids"), ",") {
+			status = 206
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
 	t.Cleanup(func() {
 		http.DefaultTransport = original
@@ -61,44 +65,45 @@ func apiFixture(t *testing.T) *gw2.Client {
 func TestMCPTools(t *testing.T) {
 	ctx, session := connectTest(t, New(apiFixture(t)))
 	listed, err := session.ListTools(ctx, nil)
-	check(t, err == nil && len(listed.Tools) == 20, "tool catalog: %v", err)
+	check(t, err == nil && len(listed.Tools) == 19, "tool catalog: %v", err)
 	for _, tool := range listed.Tools {
 		check(t, tool.Annotations != nil && tool.Annotations.ReadOnlyHint == (tool.Name != "put_record" && tool.Name != "delete_record"), "incorrect access annotation: %s", tool.Name)
+		check(t, tool.OutputSchema == nil, "%s advertises an output schema", tool.Name)
 	}
-	for _, call := range []struct{ name, args string }{
-		{"account_overview", `{}`}, {"list_characters", `{}`},
-		{"get_items", `{"item_ids":[7]}`}, {"get_currencies", `{"currency_ids":[1]}`},
-		{"find_item", `{"item_id":7}`}, {"find_items", `{"item_ids":[7,8]}`},
-		{"get_character_crafting", `{"character_name":"Hero"}`}, {"get_market_prices", `{"item_ids":[7]}`},
-		{"search_recipes", `{"output_item_id":7}`}, {"get_recipes", `{"recipe_ids":[42]}`}, {"get_account_recipes", `{}`},
-		{"list_api_endpoints", `{}`}, {"query_api", `{"route":"items","ids":["7"]}`},
-		{"get_reference", `{"url":"https://wiki.guildwars2.com/wiki/Test"}`},
-		{"quote_trades", `{"trades":[{"item_id":7,"quantity":2,"mode":"buy_order","unit_price":110}]}`},
+	for _, call := range []struct{ name, args, want string }{
+		{"account_overview", `{}`, `{"account":{"id":"account","name":"Test","world":1001},"permissions":["inventories"],"wallet":[{"id":1,"name":"Coin","value":99}]}`},
+		{"list_characters", `{}`, `["Hero"]`},
+		{"get_items", `{"item_ids":[7,8,8,7]}`, `{"items":[{"id":7,"name":"Test & item","type":"","rarity":""}],"missing":[8]}`},
+		{"get_currencies", `{"currency_ids":[2]}`, `[{"id":2,"name":"Karma"}]`},
+		{"get_currencies", `{}`, `[{"id":1,"name":"Coin"},{"id":2,"name":"Karma"}]`},
+		{"find_items", `{"item_ids":[8,7]}`, `{"items":[{"item_id":7,"total":3,"locations":[{"location":"bank","count":2},{"location":"character:Hero","count":1}]},{"item_id":8,"total":0}],"complete":true,"sources_checked":4}`},
+		{"get_character_crafting", `{"character_name":"Hero"}`, `[{"discipline":"Artificer","rating":400,"active":true}]`},
+		{"get_market_prices", `{"item_ids":[7,8]}`, `{"no_listings":[8],"prices":[{"id":7,"buy":100,"buy_qty":3,"sell":120,"sell_qty":3}]}`},
+		{"search_recipes", `{"output_item_id":7}`, `{"count":1,"recipes":[{"id":42,"type":"","output_item_id":7,"output_item_name":"Test & item","output_item_count":1,"min_rating":0,"disciplines":null,"ingredients":[{"type":"Item","id":7,"name":"Test & item","count":2},{"type":"Currency","id":1,"count":5}]}]}`},
+		{"get_account_recipes", `{"recipe_ids":[42,43]}`, `{"not_unlocked":[43],"unlocked":[42]}`},
+		{"list_api_endpoints", `{}`, "account [a]\nitems [l]"},
+		{"list_api_endpoints", `{"prefix":"/v2/acc"}`, "account [a]"},
+		{"quote_trades", `{"trades":[{"item_id":7,"quantity":2,"mode":"buy_instant"},{"item_id":7,"quantity":4,"mode":"sell_instant"},{"item_id":7,"quantity":2,"mode":"buy_order","unit_price":110},{"item_id":7,"quantity":2,"mode":"sell_listing","unit_price":110},{"item_id":8,"quantity":1,"mode":"buy_instant"}]}`, `"quotes":[` +
+			`{"item_id":7,"quantity":2,"mode":"buy_instant","gross":240,"filled":2,"net":240},` +
+			`{"item_id":7,"quantity":4,"mode":"sell_instant","gross":300,"filled":3,"unfilled":1,"listing_fee":15,"exchange_fee":30,"net":255},` +
+			`{"item_id":7,"quantity":2,"mode":"buy_order","gross":220,"filled":2,"net":220},` +
+			`{"item_id":7,"quantity":2,"mode":"sell_listing","gross":220,"filled":2,"listing_fee":11,"exchange_fee":22,"net":187},` +
+			`{"item_id":8,"quantity":1,"mode":"buy_instant","error":"item has no Trading Post listings"}]`},
 	} {
 		result := callTool(t, ctx, session, call.name, call.args)
-		check(t, !result.IsError && toolData[any](t, result) != nil, "%s failed: %+v", call.name, result)
+		check(t, !result.IsError, "%s failed: %+v", call.name, result.Content[0])
+		got := toolText(t, result)
+		check(t, got == call.want || call.name == "quote_trades" && strings.HasSuffix(got, call.want+"}"), "%s %s\n got %s\nwant %s", call.name, call.args, got, call.want)
 	}
-	for _, want := range []struct {
-		mode                                             string
-		gross, listing, exchange, delivery, net, upfront int64
-		conditional                                      bool
-	}{
-		{"buy_instant", 240, 0, 0, 0, 240, 240, false},
-		{"buy_order", 220, 0, 0, 0, 220, 220, true},
-		{"sell_instant", 200, 10, 20, 180, 170, 10, false},
-		{"sell_listing", 220, 11, 22, 198, 187, 11, true},
+	got := toolData[struct{ Recipes []recipe }](t, callTool(t, ctx, session, "get_recipes", `{"recipe_ids":[42]}`))
+	check(t, len(got.Recipes) == 1 && got.Recipes[0].Ingredients[0].Name == "Test & item", "recipes: %+v", got)
+	for _, call := range []struct{ name, args string }{
+		{"quote_trades", `{"trades":[{"item_id":7,"quantity":1,"mode":"unknown"}]}`},
+		{"get_items", `{"item_ids":[]}`}, {"get_items", `{"item_ids":[0]}`},
+		{"search_recipes", `{}`}, {"list_api_endpoints", `{"prefix":"events"}`},
 	} {
-		price := ""
-		if want.conditional {
-			price = `,"unit_price":110`
-		}
-		args := fmt.Sprintf(`{"item_id":7,"quantity":2,"mode":%q%s}`, want.mode, price)
-		got := toolData[quote](t, callTool(t, ctx, session, "quote_trade", args))
-		check(t, got.Gross == want.gross && got.Covered == 2 && got.Unfilled == 0 && got.Conditional == want.conditional, "%s fill: %+v", want.mode, got)
-		check(t, got.ListingFeeEstimate == want.listing && got.ExchangeFeeEstimate == want.exchange && got.DeliveryProceedsEstimate == want.delivery && got.NetEstimate == want.net && got.Upfront == want.upfront, "%s settlement: %+v", want.mode, got)
+		check(t, callTool(t, ctx, session, call.name, call.args).IsError, "invalid %s accepted: %s", call.name, call.args)
 	}
-	bad := callTool(t, ctx, session, "quote_trade", `{"item_id":7,"quantity":1,"mode":"unknown"}`)
-	check(t, bad.IsError, "invalid quote accepted")
 }
 
 func TestRecordToolSerialization(t *testing.T) {

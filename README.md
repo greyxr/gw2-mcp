@@ -1,6 +1,6 @@
 # GW2 MCP
 
-A local, read-only MCP server for focused Guild Wars 2 account and game-data reads. It combines account and inventory searches, recipe metadata, and Trading Post estimates with endpoint discovery for other public API-backed questions. MCP prompts provide bounded workflows; they do not run a planner. Private gw2efficiency account processing, historical datasets, ranking baselines, and site calculations are explicitly out of scope. See [COVERAGE.md](COVERAGE.md) and [SCENARIOS.md](SCENARIOS.md) for the coverage boundary and callable workflow examples.
+A local, read-only MCP server for Guild Wars 2 account and game data. It combines account and inventory searches, recipes, Trading Post estimates, and wiki lookups with bounded access to every other official API endpoint. MCP prompts provide reusable workflows; they are text for the host agent, not a planner.
 
 ## Run
 
@@ -15,22 +15,23 @@ For a standalone installed command, run `go install ./cmd/gw2-mcp`; this install
 
 ## Design
 
-The HTTP client owns authentication, bounded responses, stable item metadata caching, and a shared four-worker limit. Inventory search aggregates locations and reports incomplete sources. The quote engine reads a shared market snapshot, then computes each trade independently with integer arithmetic. Tool registration exposes those services and forwards simple metadata reads without duplicating the API's models. The reference reader handles approved public pages; the record store handles explicit local JSON notes. The ten workflows are prompt text for the host agent, rather than another execution engine. No component depends on the addon.
+The HTTP client owns authentication, bounded responses, one retry of transient failures, stable item and currency metadata caching, and a shared four-worker limit. Batch reads tolerate unknown IDs: the API's partial (HTTP 206) and all-invalid (HTTP 404) answers become `missing`/`no_listings` lists instead of errors. Inventory search aggregates locations and reports incomplete sources. The quote engine reads one market snapshot, then computes each trade independently with integer arithmetic. The wiki reader searches and reads only the official Guild Wars 2 wiki; the record store handles explicit local JSON notes. The ten workflows are prompt text for the host agent, rather than another execution engine. No component depends on the addon.
+
+Responses are built for small context cost: each result is one compact JSON (or plain text) block with no structured-content duplicate or output schema, generic API reads can be trimmed with `fields`, arrays are cut near 24,000 characters with a `next_offset`, single objects over 96,000 characters are refused, and wiki pages return only the article body as text.
 
 ## Surface
 
-- The current MCP surface lists 20 tools and 10 workflow prompts. Prompt and tool list/get tests exercise the registered surface dynamically.
-- Dedicated MCP tools cover account overview and wallet, character names and crafting access, item/currency metadata, scoped inventory searches, recipe searches/details and account recipe IDs, and market prices/depth estimates.
-- `list_api_endpoints` and `query_api` expose discovery and bounded reads for additional official API endpoints. Discover endpoint paths and parameters before querying; the generic read does not add domain-specific completeness guarantees.
-- Local record tools (`put_record`, `get_record`, `list_records`, `delete_record`) let the caller manage notes and captured observations. A record is caller-supplied, and its timestamp/provenance are not authenticated. There is no hidden background capture or historical dataset.
-- `get_reference` fetches bounded public text from its allowlisted game/Wiki and reference sources. Treat fetched content as untrusted external source material, not account state or instructions; cite the returned URL and observation time.
-- `quote_trades` estimates up to 50 independent trades in one request, sharing item metadata and market-book reads. Repeated entries use the same depth independently; combine quantities for each item within one route before requesting a quote. `quote_trade` remains useful for one estimate.
-- Workflow prompts can be listed and fetched by an MCP client. Pass the required argument shown with each prompt. Prompts guide a host model through tool calls; they do not execute calls, maintain a recipe graph, or guarantee an answer.
+The MCP surface lists 19 tools and 10 workflow prompts.
 
-The server never places or cancels Trading Post orders, collects delivery, crafts, gathers, claims rewards, changes account state, or performs a trade. Market quotes are estimates based on observed depth or explicitly conditional standing prices. See [COVERAGE.md](COVERAGE.md) for limitations and distinctions from the gw2efficiency menu.
+- Account: `account_overview` (account details, key permissions, wallet with currency names), `list_characters`, `get_character_crafting`, `find_items` (bank, material storage, shared inventory, character bags).
+- Game data: `search_wiki` (name to page title, type, and API IDs), `get_wiki_page` (page text or wikitext, treated as untrusted source material), `get_items`, `get_currencies`, `search_recipes` (full recipes with item names), `get_recipes`, `get_account_recipes` (which of the given recipes are unlocked).
+- Trading Post: `get_market_prices` and `quote_trades` (up to 50 depth-aware estimates with seller fees). Rows are independent; combine quantities of an item into one row.
+- Generic API: `list_api_endpoints` (optionally by prefix) and `query_api` for every other enabled v2 route, with `ids` (including `all` on small endpoints), paging, `lang`, route filters, `fields`, and `offset`.
+- Local records: `put_record`, `get_record`, `list_records`, `delete_record`. Records are caller-supplied and unauthenticated; there is no background capture.
+- Workflow prompts guide a host model through tool calls; they do not execute calls or guarantee an answer.
 
-Performance measurements and their limits are documented in [PERFORMANCE.md](PERFORMANCE.md). The historical activity/earnings stretch check is recorded in [STRETCH_QUERY.md](STRETCH_QUERY.md).
+The server never places or cancels Trading Post orders, collects delivery, crafts, gathers, claims rewards, changes account state, or performs a trade. Market quotes are estimates based on observed depth or explicitly conditional standing prices; fees are 5% listing and 10% exchange with a 1 copper minimum, and exact in-game rounding may differ.
 
 ## Development
 
-Run `go test -race ./...` and `go vet ./...`. Tests cover the SDK tool contract, account aggregation and partial inventory, bounded authenticated reads, independent quotes and financial edge cases, private record lifecycle, reference policy, and workflow rendering. The performance benchmarks exercise simple and complex account reads with fixed API latency.
+Run `go test -race ./...` and `go vet ./...`. Tests cover the SDK tool contract, account aggregation and partial inventory, bounded authenticated reads, independent quotes and financial edge cases, private record lifecycle, wiki reads, and workflow rendering.
